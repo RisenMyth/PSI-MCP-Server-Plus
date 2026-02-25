@@ -6,10 +6,7 @@
 
     <depends>com.intellij.modules.platform</depends>
 
-    <resource-bundle>messages.MyBundle</resource-bundle>
-
     <extensions defaultExtensionNs="com.intellij">
-        <toolWindow factoryClass="com.github.risenmyth.psimcpserverplus.toolWindow.MyToolWindowFactory" id="MyToolWindow"/>
         <postStartupActivity implementation="com.github.risenmyth.psimcpserverplus.startup.MyProjectActivity" />
     </extensions>
 </idea-plugin>

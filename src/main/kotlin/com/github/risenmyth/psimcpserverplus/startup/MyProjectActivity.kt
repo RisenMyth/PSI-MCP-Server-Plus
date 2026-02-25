@@ -1,5 +1,7 @@
 package com.github.risenmyth.psimcpserverplus.startup
 
+import com.github.risenmyth.psimcpserverplus.services.MyProjectService
+import com.intellij.openapi.components.service
 import com.intellij.openapi.diagnostic.thisLogger
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.startup.ProjectActivity
@@ -7,6 +9,8 @@ import com.intellij.openapi.startup.ProjectActivity
 class MyProjectActivity : ProjectActivity {
 
     override suspend fun execute(project: Project) {
-        thisLogger().warn("Don't forget to remove all non-needed sample code files with their corresponding registration entries in `plugin.xml`.")
+        val service = project.service<MyProjectService>()
+        service.ensureStarted()
+        thisLogger().info("PSI MCP HTTP Stream server started on port ${service.serverPort()} for project '${project.name}'.")
     }
 }
