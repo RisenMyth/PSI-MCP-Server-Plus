@@ -1,5 +1,6 @@
 package com.github.risenmyth.psimcpserverplus.mcp
 
+import com.github.risenmyth.psimcpserverplus.settings.McpServerBindConfig
 import com.intellij.openapi.application.ReadAction
 import com.intellij.openapi.diagnostic.thisLogger
 import com.intellij.openapi.project.Project
@@ -43,6 +44,7 @@ class PsiMcpHttpServer(
     private val resolveProject: (String?) -> ProjectRoutingResult,
     private val normalizeProjectPath: (String) -> String?,
     private val findProjectByPath: (String) -> Project?,
+    private val resolveBindConfig: () -> McpServerBindConfig,
 ) {
     private val json = Json {
         ignoreUnknownKeys = true
@@ -52,6 +54,8 @@ class PsiMcpHttpServer(
     @Volatile
     private var server: HttpServer? = null
     @Volatile
+    private var boundHost: String = ""
+    @Volatile
     private var boundPort: Int = -1
 
     fun start() {
@@ -59,17 +63,18 @@ class PsiMcpHttpServer(
             return
         }
 
-        val preferredPort = System.getProperty("psimcp.port")?.toIntOrNull() ?: 8765
+        val config = resolveBindConfig()
         val created = try {
-            HttpServer.create(InetSocketAddress("127.0.0.1", preferredPort), 0)
+            HttpServer.create(InetSocketAddress(config.listenAddress, config.port), 0)
         } catch (_: BindException) {
-            HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+            HttpServer.create(InetSocketAddress(config.listenAddress, 0), 0)
         }
 
         created.createContext("/mcp", McpHttpHandler())
         created.executor = Executors.newCachedThreadPool()
         created.start()
 
+        boundHost = created.address.hostString
         boundPort = created.address.port
         server = created
     }
@@ -77,11 +82,16 @@ class PsiMcpHttpServer(
     fun stop() {
         server?.stop(0)
         server = null
+        boundHost = ""
         boundPort = -1
         sessions.clear()
     }
 
+    fun host(): String = boundHost
+
     fun port(): Int = boundPort
+
+    fun isRunning(): Boolean = server != null
 
     fun dispatchForTest(requestJson: String, sessionId: String?, projectPath: String? = null): String? {
         val parsed = json.parseToJsonElement(requestJson).jsonObject

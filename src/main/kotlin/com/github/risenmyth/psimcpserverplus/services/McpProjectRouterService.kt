@@ -2,6 +2,8 @@ package com.github.risenmyth.psimcpserverplus.services
 
 import com.github.risenmyth.psimcpserverplus.mcp.ProjectRoutingResult
 import com.github.risenmyth.psimcpserverplus.mcp.PsiMcpHttpServer
+import com.github.risenmyth.psimcpserverplus.settings.McpServerBindConfig
+import com.github.risenmyth.psimcpserverplus.settings.McpServerSettingsService
 import com.intellij.openapi.components.Service
 import com.intellij.openapi.components.service
 import com.intellij.openapi.project.Project
@@ -15,6 +17,7 @@ class McpProjectRouterService {
         resolveProject = ::resolveProject,
         normalizeProjectPath = ::normalizeProjectPath,
         findProjectByPath = { normalizedPath -> projectRegistry[normalizedPath] },
+        resolveBindConfig = { McpServerSettingsService.getInstance().getBindConfig() },
     )
 
     fun registerProject(project: Project) {
@@ -31,7 +34,19 @@ class McpProjectRouterService {
         httpServer.start()
     }
 
+    fun serverHost(): String = httpServer.host()
+
     fun serverPort(): Int = httpServer.port()
+
+    fun applyServerConfigIfChanged(oldConfig: McpServerBindConfig, newConfig: McpServerBindConfig) {
+        if (oldConfig == newConfig) {
+            return
+        }
+        if (httpServer.isRunning()) {
+            httpServer.stop()
+            httpServer.start()
+        }
+    }
 
     fun dispatchForTest(requestJson: String, sessionId: String?, projectPath: String? = null): String? {
         return httpServer.dispatchForTest(requestJson, sessionId, projectPath)

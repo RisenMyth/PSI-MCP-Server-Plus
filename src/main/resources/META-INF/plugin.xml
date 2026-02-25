@@ -8,5 +8,10 @@
 
     <extensions defaultExtensionNs="com.intellij">
         <postStartupActivity implementation="com.github.risenmyth.psimcpserverplus.startup.MyProjectActivity" />
+        <applicationConfigurable
+                parentId="tools"
+                id="com.github.risenmyth.psimcpserverplus.settings"
+                displayName="PSI MCP Server Plus"
+                instance="com.github.risenmyth.psimcpserverplus.settings.McpServerConfigurable"/>
     </extensions>
 </idea-plugin>

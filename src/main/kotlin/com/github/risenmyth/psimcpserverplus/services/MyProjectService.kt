@@ -13,6 +13,8 @@ class MyProjectService(private val project: Project) {
         routerService.ensureServerStarted()
     }
 
+    fun serverHost(): String = routerService.serverHost()
+
     fun serverPort(): Int = routerService.serverPort()
 
     fun dispatchForTest(requestJson: String, sessionId: String?, projectPath: String? = null): String? {

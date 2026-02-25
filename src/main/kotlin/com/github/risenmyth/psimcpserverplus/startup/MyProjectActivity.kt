@@ -11,6 +11,6 @@ class MyProjectActivity : ProjectActivity {
     override suspend fun execute(project: Project) {
         val service = project.service<MyProjectService>()
         service.ensureStarted()
-        thisLogger().info("PSI MCP HTTP Stream server started on port ${service.serverPort()} for project '${project.name}'.")
+        thisLogger().info("PSI MCP HTTP Stream server started on ${service.serverHost()}:${service.serverPort()} for project '${project.name}'.")
     }
 }
