@@ -2,6 +2,7 @@ package com.github.risenmyth.psimcpserverplus.services
 
 import com.github.risenmyth.psimcpserverplus.mcp.ProjectRoutingResult
 import com.github.risenmyth.psimcpserverplus.mcp.PsiMcpHttpServer
+import com.github.risenmyth.psimcpserverplus.mcp.PsiMcpProjectRouter
 import com.github.risenmyth.psimcpserverplus.settings.McpServerBindConfig
 import com.github.risenmyth.psimcpserverplus.settings.McpServerSettingsService
 import com.intellij.openapi.components.Service
@@ -11,12 +12,10 @@ import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 
 @Service(Service.Level.APP)
-class McpProjectRouterService {
+class PsiMcpRouterService : PsiMcpProjectRouter {
     private val projectRegistry = ConcurrentHashMap<String, Project>()
     private val httpServer = PsiMcpHttpServer(
-        resolveProject = ::resolveProject,
-        normalizeProjectPath = ::normalizeProjectPath,
-        findProjectByPath = { normalizedPath -> projectRegistry[normalizedPath] },
+        router = this,
         resolveBindConfig = { McpServerSettingsService.getInstance().getBindConfig() },
     )
 
@@ -52,7 +51,7 @@ class McpProjectRouterService {
         return httpServer.dispatchForTest(requestJson, sessionId, projectPath)
     }
 
-    fun resolveProject(projectPathHeader: String?): ProjectRoutingResult {
+    override fun resolveProject(projectPathHeader: String?): ProjectRoutingResult {
         val registeredPaths = projectRegistry.keys.toSet()
         return when (val pathResolution = resolveProjectPath(projectPathHeader, registeredPaths, ::normalizeProjectPath)) {
             is ProjectPathResolution.Error -> ProjectRoutingResult.error(pathResolution.message)
@@ -67,7 +66,7 @@ class McpProjectRouterService {
         }
     }
 
-    fun normalizeProjectPath(path: String): String? {
+    override fun normalizeProjectPath(path: String): String? {
         val trimmed = path.trim()
         if (trimmed.isBlank()) {
             return null
@@ -82,6 +81,8 @@ class McpProjectRouterService {
         return normalized
     }
 
+    override fun findProjectByPath(normalizedPath: String): Project? = projectRegistry[normalizedPath]
+
     private fun normalizedProjectPathFor(project: Project): String? {
         val rawPath = project.basePath
             ?.takeIf { it.isNotBlank() }
@@ -94,7 +95,7 @@ class McpProjectRouterService {
     internal fun registeredProjectPaths(): Set<String> = projectRegistry.keys.toSet()
 
     companion object {
-        fun getInstance(): McpProjectRouterService = service()
+        fun getInstance(): PsiMcpRouterService = service()
 
         internal fun resolveProjectPath(
             projectPathHeader: String?,

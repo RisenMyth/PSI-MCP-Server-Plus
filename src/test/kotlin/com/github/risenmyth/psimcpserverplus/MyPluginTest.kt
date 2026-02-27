@@ -1,18 +1,29 @@
 package com.github.risenmyth.psimcpserverplus
 
-import com.github.risenmyth.psimcpserverplus.services.McpProjectRouterService
-import com.github.risenmyth.psimcpserverplus.services.MyProjectService
+import com.github.risenmyth.psimcpserverplus.mcp.PsiMcpHttpServer
+import com.github.risenmyth.psimcpserverplus.mcp.PsiMcpInMemoryToolRegistry
+import com.github.risenmyth.psimcpserverplus.mcp.PsiMcpProjectRouter
+import com.github.risenmyth.psimcpserverplus.mcp.PsiMcpToolRegistration
+import com.github.risenmyth.psimcpserverplus.services.PsiMcpProjectService
+import com.github.risenmyth.psimcpserverplus.services.PsiMcpRouterService
 import com.github.risenmyth.psimcpserverplus.services.ProjectPathResolution
 import com.intellij.ide.highlighter.XmlFileType
 import com.intellij.openapi.components.service
 import com.intellij.openapi.util.io.FileUtil
+import com.intellij.openapi.project.Project
 import com.intellij.testFramework.fixtures.BasePlatformTestCase
 import com.intellij.util.PsiErrorElementUtil
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import java.util.concurrent.Callable
+import java.util.concurrent.Executors
+import java.util.concurrent.Future
 
 class MyPluginTest : BasePlatformTestCase() {
     private val json = Json { ignoreUnknownKeys = true }
@@ -32,7 +43,7 @@ class MyPluginTest : BasePlatformTestCase() {
     }
 
     fun testMcpToolsList() {
-        val projectService = project.service<MyProjectService>()
+        val projectService = project.service<PsiMcpProjectService>()
         projectService.ensureStarted()
 
         val initResponse = projectService.dispatchForTest(
@@ -77,7 +88,7 @@ class MyPluginTest : BasePlatformTestCase() {
         )
 
         val normalizedPath = FileUtil.toSystemIndependentName(psiFile.virtualFile.url)
-        val projectService = project.service<MyProjectService>()
+        val projectService = project.service<PsiMcpProjectService>()
         projectService.ensureStarted()
 
         val initResponse = projectService.dispatchForTest(
@@ -111,7 +122,7 @@ class MyPluginTest : BasePlatformTestCase() {
     }
 
     fun testInitializeWithoutProjectPathSucceedsWhenSingleProjectRegistered() {
-        val projectService = project.service<MyProjectService>()
+        val projectService = project.service<PsiMcpProjectService>()
         projectService.ensureStarted()
 
         val initResponse = projectService.dispatchForTest(
@@ -127,7 +138,7 @@ class MyPluginTest : BasePlatformTestCase() {
     }
 
     fun testInitializeWithValidProjectPathSucceeds() {
-        val projectService = project.service<MyProjectService>()
+        val projectService = project.service<PsiMcpProjectService>()
         projectService.ensureStarted()
 
         val initResponse = projectService.dispatchForTest(
@@ -144,7 +155,7 @@ class MyPluginTest : BasePlatformTestCase() {
     }
 
     fun testInitializeWithUnknownProjectPathReturnsError() {
-        val projectService = project.service<MyProjectService>()
+        val projectService = project.service<PsiMcpProjectService>()
         projectService.ensureStarted()
 
         val initResponse = projectService.dispatchForTest(
@@ -162,7 +173,7 @@ class MyPluginTest : BasePlatformTestCase() {
     }
 
     fun testSessionProjectPathMismatchReturnsError() {
-        val projectService = project.service<MyProjectService>()
+        val projectService = project.service<PsiMcpProjectService>()
         projectService.ensureStarted()
 
         val initResponse = projectService.dispatchForTest(
@@ -199,7 +210,7 @@ class MyPluginTest : BasePlatformTestCase() {
     }
 
     fun testResolveProjectPathRequiresHeaderWhenMultipleProjectsRegistered() {
-        val resolution = McpProjectRouterService.resolveProjectPath(
+        val resolution = PsiMcpRouterService.resolveProjectPath(
             projectPathHeader = null,
             registeredPaths = setOf("/p1", "/p2"),
             normalizePath = { it },
@@ -208,6 +219,239 @@ class MyPluginTest : BasePlatformTestCase() {
         assertTrue(resolution is ProjectPathResolution.Error)
         val message = (resolution as ProjectPathResolution.Error).message
         assertEquals("PROJECT_PATH header is required when multiple projects are open", message)
+    }
+
+    fun testRegistryRejectsContractChangeForSameToolId() {
+        val registry = PsiMcpInMemoryToolRegistry()
+
+        registry.registerTool(
+            PsiMcpToolRegistration(
+                id = "same_id",
+                title = "Title",
+                description = "Desc",
+                inputSchema = buildJsonObject {
+                    put("type", JsonPrimitive("object"))
+                    put("properties", buildJsonObject { })
+                },
+                handler = { _, _ -> errorResult("first") },
+            ),
+        )
+
+        try {
+            registry.registerTool(
+                PsiMcpToolRegistration(
+                    id = "same_id",
+                    title = "Changed",
+                    description = "Desc",
+                    inputSchema = buildJsonObject {
+                        put("type", JsonPrimitive("object"))
+                        put("properties", buildJsonObject { })
+                    },
+                    handler = { _, _ -> errorResult("second") },
+                ),
+            )
+            fail("Expected IllegalArgumentException for incompatible contract re-registration")
+        } catch (_: IllegalArgumentException) {
+            // expected
+        }
+    }
+
+    fun testRegistryListIsDeterministicByToolId() {
+        val registry = PsiMcpInMemoryToolRegistry()
+        registry.registerTool(testTool("z_tool"))
+        registry.registerTool(testTool("a_tool"))
+        registry.registerTool(testTool("m_tool"))
+
+        val ids = registry.listTools().map { it.id }
+        assertEquals(listOf("a_tool", "m_tool", "z_tool"), ids)
+    }
+
+    fun testToolsListDeterministicAndRegistryDerived() {
+        val projectService = project.service<PsiMcpProjectService>()
+        projectService.ensureStarted()
+
+        val initJson = parseObject(
+            projectService.dispatchForTest(
+                """
+                {"jsonrpc":"2.0","id":201,"method":"initialize","params":{}}
+                """.trimIndent(),
+                null,
+            )!!,
+        )
+        val sessionId = extractSessionId(initJson)!!
+
+        projectService.dispatchForTest(
+            """
+            {"jsonrpc":"2.0","method":"notifications/initialized"}
+            """.trimIndent(),
+            sessionId,
+        )
+
+        val response1 = parseObject(
+            projectService.dispatchForTest(
+                """
+                {"jsonrpc":"2.0","id":202,"method":"tools/list"}
+                """.trimIndent(),
+                sessionId,
+            )!!,
+        )
+
+        val response2 = parseObject(
+            projectService.dispatchForTest(
+                """
+                {"jsonrpc":"2.0","id":203,"method":"tools/list"}
+                """.trimIndent(),
+                sessionId,
+            )!!,
+        )
+
+        val tools1 = response1["result"]!!.jsonObject["tools"]!!.jsonArray
+        val tools2 = response2["result"]!!.jsonObject["tools"]!!.jsonArray
+
+        assertEquals(tools1.map { it.jsonObject["name"]!!.jsonPrimitive.content }, tools2.map { it.jsonObject["name"]!!.jsonPrimitive.content })
+        assertEquals(listOf("find_definition", "find_usages", "get_containing_context"), tools1.map { it.jsonObject["name"]!!.jsonPrimitive.content })
+    }
+
+    fun testExistingAndNewToolInvokeInSameRuntime() {
+        val registry = PsiMcpInMemoryToolRegistry()
+        registry.registerTool(testTool("existing_tool"))
+        registry.registerTool(testTool("new_tool"))
+
+        val existing = registry.findTool("existing_tool")?.handler?.invoke(project, buildJsonObject { })
+        val added = registry.findTool("new_tool")?.handler?.invoke(project, buildJsonObject { })
+
+        assertNotNull(existing)
+        assertNotNull(added)
+        assertFalse(existing!!["isError"]!!.jsonPrimitive.content.toBoolean())
+        assertFalse(added!!["isError"]!!.jsonPrimitive.content.toBoolean())
+    }
+
+    fun testConcurrentRegistryAccessAndProjectIsolation() {
+        val router = object : PsiMcpProjectRouter {
+            private val known = setOf("/project-a", "/project-b")
+
+            override fun resolveProject(projectPathHeader: String?) = when {
+                projectPathHeader == null -> error("PROJECT_PATH required")
+                projectPathHeader in known -> com.github.risenmyth.psimcpserverplus.mcp.ProjectRoutingResult.resolved(project, projectPathHeader)
+                else -> com.github.risenmyth.psimcpserverplus.mcp.ProjectRoutingResult.error("Unknown PROJECT_PATH")
+            }
+
+            override fun normalizeProjectPath(path: String): String? = path.ifBlank { null }
+
+            override fun findProjectByPath(normalizedPath: String): Project? = if (normalizedPath in known) project else null
+        }
+
+        val server = PsiMcpHttpServer(
+            router = router,
+            resolveBindConfig = { error("not needed") },
+        )
+
+        val sessionA = extractSessionId(
+            parseObject(
+                server.dispatchForTest(
+                    """
+                    {"jsonrpc":"2.0","id":301,"method":"initialize","params":{}}
+                    """.trimIndent(),
+                    null,
+                    "/project-a",
+                )!!,
+            ),
+        )!!
+
+        val sessionB = extractSessionId(
+            parseObject(
+                server.dispatchForTest(
+                    """
+                    {"jsonrpc":"2.0","id":302,"method":"initialize","params":{}}
+                    """.trimIndent(),
+                    null,
+                    "/project-b",
+                )!!,
+            ),
+        )!!
+
+        server.dispatchForTest(
+            """
+            {"jsonrpc":"2.0","method":"notifications/initialized"}
+            """.trimIndent(),
+            sessionA,
+            "/project-a",
+        )
+        server.dispatchForTest(
+            """
+            {"jsonrpc":"2.0","method":"notifications/initialized"}
+            """.trimIndent(),
+            sessionB,
+            "/project-b",
+        )
+
+        val pool = Executors.newFixedThreadPool(8)
+        try {
+            val jobs = mutableListOf<Future<Boolean>>()
+            repeat(40) { idx ->
+                jobs += pool.submit(Callable {
+                    val responseA = parseObject(
+                        server.dispatchForTest(
+                            """
+                            {"jsonrpc":"2.0","id":${400 + idx},"method":"tools/list"}
+                            """.trimIndent(),
+                            sessionA,
+                            "/project-a",
+                        )!!,
+                    )
+                    val responseB = parseObject(
+                        server.dispatchForTest(
+                            """
+                            {"jsonrpc":"2.0","id":${500 + idx},"method":"tools/list"}
+                            """.trimIndent(),
+                            sessionB,
+                            "/project-b",
+                        )!!,
+                    )
+                    val mismatch = parseObject(
+                        server.dispatchForTest(
+                            """
+                            {"jsonrpc":"2.0","id":${600 + idx},"method":"tools/list"}
+                            """.trimIndent(),
+                            sessionA,
+                            "/project-b",
+                        )!!,
+                    )
+
+                    responseA["result"] != null &&
+                        responseB["result"] != null &&
+                        mismatch["error"]?.jsonObject?.get("message")?.jsonPrimitive?.contentOrNull == "PROJECT_PATH does not match session-bound project"
+                })
+            }
+            jobs.forEach { assertTrue(it.get()) }
+        } finally {
+            pool.shutdownNow()
+        }
+    }
+
+    private fun testTool(id: String): PsiMcpToolRegistration {
+        return PsiMcpToolRegistration(
+            id = id,
+            title = id,
+            description = id,
+            inputSchema = buildJsonObject {
+                put("type", JsonPrimitive("object"))
+                put("properties", buildJsonObject { })
+            },
+            handler = { _, _ ->
+                buildJsonObject {
+                    put("content", json.parseToJsonElement("[{\"type\":\"text\",\"text\":\"ok\"}]") )
+                    put("isError", JsonPrimitive(false))
+                }
+            },
+        )
+    }
+
+    private fun errorResult(message: String): JsonObject {
+        return buildJsonObject {
+            put("content", json.parseToJsonElement("[{\"type\":\"text\",\"text\":\"$message\"}]") )
+            put("isError", JsonPrimitive(true))
+        }
     }
 
     private fun parseObject(raw: String): JsonObject = json.parseToJsonElement(raw).jsonObject

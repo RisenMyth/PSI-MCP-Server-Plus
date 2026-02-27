@@ -1,6 +1,6 @@
 package com.github.risenmyth.psimcpserverplus.settings
 
-import com.github.risenmyth.psimcpserverplus.services.McpProjectRouterService
+import com.github.risenmyth.psimcpserverplus.services.PsiMcpRouterService
 import com.intellij.openapi.options.Configurable
 import com.intellij.openapi.options.ConfigurationException
 import com.intellij.util.ui.FormBuilder
@@ -48,7 +48,7 @@ class McpServerConfigurable : Configurable {
         val oldConfig = settingsService.getBindConfig()
         settingsService.updateBindConfig(newConfig)
         val sanitizedNewConfig = settingsService.getBindConfig()
-        McpProjectRouterService.getInstance().applyServerConfigIfChanged(oldConfig, sanitizedNewConfig)
+        PsiMcpRouterService.getInstance().applyServerConfigIfChanged(oldConfig, sanitizedNewConfig)
     }
 
     override fun reset() {

@@ -39,26 +39,35 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 
 class PsiMcpHttpServer(
-    private val resolveProject: (String?) -> ProjectRoutingResult,
-    private val normalizeProjectPath: (String) -> String?,
-    private val findProjectByPath: (String) -> Project?,
+    private val router: PsiMcpProjectRouter,
     private val resolveBindConfig: () -> McpServerBindConfig,
-) {
+    private val toolRegistry: PsiMcpToolRegistry = PsiMcpInMemoryToolRegistry(),
+    private val toolExecutor: PsiMcpToolExecutor = PsiMcpDefaultToolExecutor(toolRegistry),
+) : PsiMcpTransportServer {
     private val json = Json {
         ignoreUnknownKeys = true
         prettyPrint = false
     }
     private val sessions = ConcurrentHashMap<String, SessionState>()
+
     @Volatile
     private var server: HttpServer? = null
+
     @Volatile
     private var boundHost: String = ""
+
     @Volatile
     private var boundPort: Int = -1
 
-    fun start() {
+    init {
+        registerBuiltInTools()
+    }
+
+    override fun start() {
         if (server != null) {
             return
         }
@@ -79,7 +88,7 @@ class PsiMcpHttpServer(
         server = created
     }
 
-    fun stop() {
+    override fun stop() {
         server?.stop(0)
         server = null
         boundHost = ""
@@ -87,11 +96,11 @@ class PsiMcpHttpServer(
         sessions.clear()
     }
 
-    fun host(): String = boundHost
+    override fun host(): String = boundHost
 
-    fun port(): Int = boundPort
+    override fun port(): Int = boundPort
 
-    fun isRunning(): Boolean = server != null
+    override fun isRunning(): Boolean = server != null
 
     fun dispatchForTest(requestJson: String, sessionId: String?, projectPath: String? = null): String? {
         val parsed = json.parseToJsonElement(requestJson).jsonObject
@@ -194,7 +203,7 @@ class PsiMcpHttpServer(
                 writer.write("data: {}\n\n")
                 writer.flush()
 
-                while (session.streamAttached && server != null) {
+                while (session.streamAttached() && server != null) {
                     val payload = session.pollEvent(15, TimeUnit.SECONDS)
                     if (payload == null) {
                         writer.write(": keep-alive\n\n")
@@ -232,7 +241,7 @@ class PsiMcpHttpServer(
                 if (id == null) {
                     null
                 } else {
-                    when (val resolved = resolveProject(projectPathHeader)) {
+                    when (val resolved = router.resolveProject(projectPathHeader)) {
                         is ProjectRoutingResult.Error -> rpcError(id, -32003, resolved.message)
                         is ProjectRoutingResult.Resolved -> {
                             val sessionId = UUID.randomUUID().toString()
@@ -281,14 +290,14 @@ class PsiMcpHttpServer(
                     if (!session.initialized) {
                         return rpcError(id, -32002, "Session not initialized")
                     }
-                    val project = findProjectByPath(session.projectPath)
+                    val project = router.findProjectByPath(session.projectPath)
                         ?: return rpcError(id, -32003, "No project registered")
                     val params = request["params"]?.jsonObject
                         ?: return rpcError(id, -32602, "Invalid params")
                     val name = params["name"]?.jsonPrimitive?.contentOrNull
                         ?: return rpcError(id, -32602, "Tool name missing")
                     val arguments = params["arguments"]?.jsonObject ?: buildJsonObject { }
-                    val toolResult = handleToolCall(project, name, arguments)
+                    val toolResult = toolExecutor.execute(project, name, arguments)
                     rpcResult(id, toolResult)
                 }
             }
@@ -301,7 +310,7 @@ class PsiMcpHttpServer(
         if (projectPathHeader == null) {
             return null
         }
-        val normalizedHeader = normalizeProjectPath(projectPathHeader)
+        val normalizedHeader = router.normalizeProjectPath(projectPathHeader)
             ?: return "Invalid PROJECT_PATH"
         if (normalizedHeader != session.projectPath) {
             return "PROJECT_PATH does not match session-bound project"
@@ -309,13 +318,56 @@ class PsiMcpHttpServer(
         return null
     }
 
-    private fun handleToolCall(project: Project, name: String, arguments: JsonObject): JsonObject {
-        return when (name) {
-            "get_containing_context" -> containingContext(project, arguments)
-            "find_definition" -> findDefinition(project, arguments)
-            "find_usages" -> findUsages(project, arguments)
-            else -> toolError("Unknown tool: $name")
+    private fun registerBuiltInTools() {
+        val baseSchemaProperties = buildJsonObject {
+            put("file_path", buildJsonObject { put("type", JsonPrimitive("string")) })
+            put("line", buildJsonObject { put("type", JsonPrimitive("integer")) })
+            put("column", buildJsonObject { put("type", JsonPrimitive("integer")) })
+            put("include_declaration", buildJsonObject { put("type", JsonPrimitive("boolean")) })
+            put("limit", buildJsonObject { put("type", JsonPrimitive("integer")) })
         }
+
+        toolRegistry.registerTool(
+            PsiMcpToolRegistration(
+                id = "find_definition",
+                title = "Find Definition",
+                description = "Find definition location for reference at file position",
+                inputSchema = buildJsonObject {
+                    put("type", JsonPrimitive("object"))
+                    put("properties", baseSchemaProperties)
+                    put("required", JsonArray(listOf(JsonPrimitive("file_path"), JsonPrimitive("line"))))
+                },
+                handler = PsiMcpToolHandler(::findDefinition),
+            ),
+        )
+
+        toolRegistry.registerTool(
+            PsiMcpToolRegistration(
+                id = "find_usages",
+                title = "Find Usages",
+                description = "Find usages for symbol at file position",
+                inputSchema = buildJsonObject {
+                    put("type", JsonPrimitive("object"))
+                    put("properties", baseSchemaProperties)
+                    put("required", JsonArray(listOf(JsonPrimitive("file_path"), JsonPrimitive("line"))))
+                },
+                handler = PsiMcpToolHandler(::findUsages),
+            ),
+        )
+
+        toolRegistry.registerTool(
+            PsiMcpToolRegistration(
+                id = "get_containing_context",
+                title = "Get Containing Context",
+                description = "Get containing PSI context for a file location",
+                inputSchema = buildJsonObject {
+                    put("type", JsonPrimitive("object"))
+                    put("properties", baseSchemaProperties)
+                    put("required", JsonArray(listOf(JsonPrimitive("file_path"), JsonPrimitive("line"))))
+                },
+                handler = PsiMcpToolHandler(::containingContext),
+            ),
+        )
     }
 
     private fun containingContext(project: Project, arguments: JsonObject): JsonObject {
@@ -391,6 +443,22 @@ class PsiMcpHttpServer(
         })
     }
 
+    private fun toolsListResult(): JsonObject {
+        val tools = toolRegistry.listTools()
+        return buildJsonObject {
+            put("tools", buildJsonArray {
+                for (tool in tools) {
+                    add(buildJsonObject {
+                        put("name", JsonPrimitive(tool.id))
+                        put("title", JsonPrimitive(tool.title))
+                        put("description", JsonPrimitive(tool.description))
+                        put("inputSchema", tool.inputSchema)
+                    })
+                }
+            })
+        }
+    }
+
     private fun resolveLocation(project: Project, arguments: JsonObject): ResolvedLocation? {
         val filePath = arguments["file_path"]?.jsonPrimitive?.contentOrNull ?: return null
         val line = arguments["line"]?.jsonPrimitive?.intOrNull ?: return null
@@ -442,56 +510,6 @@ class PsiMcpHttpServer(
                 put("version", JsonPrimitive("1.0.1"))
             })
             put("_sessionId", JsonPrimitive(sessionId))
-        }
-    }
-
-    private fun toolsListResult(): JsonObject {
-        return buildJsonObject {
-            put("tools", buildJsonArray {
-                add(toolDef(
-                    name = "get_containing_context",
-                    description = "Get containing PSI context for a file location",
-                    required = listOf("file_path", "line"),
-                ))
-                add(toolDef(
-                    name = "find_definition",
-                    description = "Find definition location for reference at file position",
-                    required = listOf("file_path", "line"),
-                ))
-                add(toolDef(
-                    name = "find_usages",
-                    description = "Find usages for symbol at file position",
-                    required = listOf("file_path", "line"),
-                ))
-            })
-        }
-    }
-
-    private fun toolDef(name: String, description: String, required: List<String>): JsonObject {
-        return buildJsonObject {
-            put("name", JsonPrimitive(name))
-            put("description", JsonPrimitive(description))
-            put("inputSchema", buildJsonObject {
-                put("type", JsonPrimitive("object"))
-                put("properties", buildJsonObject {
-                    put("file_path", buildJsonObject {
-                        put("type", JsonPrimitive("string"))
-                    })
-                    put("line", buildJsonObject {
-                        put("type", JsonPrimitive("integer"))
-                    })
-                    put("column", buildJsonObject {
-                        put("type", JsonPrimitive("integer"))
-                    })
-                    put("include_declaration", buildJsonObject {
-                        put("type", JsonPrimitive("boolean"))
-                    })
-                    put("limit", buildJsonObject {
-                        put("type", JsonPrimitive("integer"))
-                    })
-                })
-                put("required", JsonArray(required.map(::JsonPrimitive)))
-            })
         }
     }
 
@@ -601,39 +619,20 @@ class PsiMcpHttpServer(
         @Volatile
         var initialized: Boolean = false
 
-        @Volatile
-        var streamAttached: Boolean = false
-
+        private val streamAttached = AtomicBoolean(false)
         private val eventQueue = LinkedBlockingQueue<String>()
-        private var eventCounter: Long = 0L
+        private val eventCounter = AtomicLong(0L)
 
-        fun attachStream(): Boolean {
-            if (streamAttached) {
-                return false
-            }
-            streamAttached = true
-            return true
-        }
+        fun attachStream(): Boolean = streamAttached.compareAndSet(false, true)
 
         fun detachStream() {
-            streamAttached = false
+            streamAttached.set(false)
         }
+
+        fun streamAttached(): Boolean = streamAttached.get()
 
         fun pollEvent(timeout: Long, unit: TimeUnit): String? = eventQueue.poll(timeout, unit)
 
-        fun nextEventId(): Long {
-            eventCounter += 1
-            return eventCounter
-        }
-    }
-}
-
-sealed interface ProjectRoutingResult {
-    data class Resolved(val project: Project, val projectPath: String) : ProjectRoutingResult
-    data class Error(val message: String) : ProjectRoutingResult
-
-    companion object {
-        fun resolved(project: Project, projectPath: String): ProjectRoutingResult = Resolved(project, projectPath)
-        fun error(message: String): ProjectRoutingResult = Error(message)
+        fun nextEventId(): Long = eventCounter.incrementAndGet()
     }
 }

@@ -5,8 +5,8 @@ import com.intellij.openapi.project.Project
 import com.intellij.openapi.util.Disposer
 
 @Service(Service.Level.PROJECT)
-class MyProjectService(private val project: Project) {
-    private val routerService = McpProjectRouterService.getInstance()
+class PsiMcpProjectService(private val project: Project) {
+    private val routerService = PsiMcpRouterService.getInstance()
 
     fun ensureStarted() {
         routerService.registerProject(project)
