@@ -7,6 +7,7 @@ import com.github.risenmyth.psimcpserverplus.settings.PsiMcpBindConfig
 import com.github.risenmyth.psimcpserverplus.settings.PsiMcpSettingsService
 import com.intellij.openapi.components.Service
 import com.intellij.openapi.components.service
+import com.intellij.openapi.diagnostic.thisLogger
 import com.intellij.openapi.project.Project
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
@@ -22,15 +23,21 @@ class PsiMcpRouterService : PsiMcpProjectRouter {
     fun registerProject(project: Project) {
         val key = normalizedProjectPathFor(project) ?: return
         projectRegistry[key] = project
+        thisLogger().debug("Project registered for MCP routing: path=$key, total=${projectRegistry.size}")
     }
 
     fun unregisterProject(project: Project) {
         val key = normalizedProjectPathFor(project) ?: return
         projectRegistry.remove(key, project)
+        thisLogger().debug("Project unregistered from MCP routing: path=$key, total=${projectRegistry.size}")
     }
 
     fun ensureServerStarted() {
+        val wasRunning = httpServer.isRunning()
         httpServer.start()
+        if (!wasRunning && httpServer.isRunning()) {
+            thisLogger().info("MCP router ensured HTTP server on ${httpServer.host()}:${httpServer.port()}")
+        }
     }
 
     fun serverHost(): String = httpServer.host()
@@ -41,9 +48,13 @@ class PsiMcpRouterService : PsiMcpProjectRouter {
         if (oldConfig == newConfig) {
             return
         }
+        thisLogger().info(
+            "MCP bind config changed, old=${oldConfig.listenAddress}:${oldConfig.port}, new=${newConfig.listenAddress}:${newConfig.port}",
+        )
         if (httpServer.isRunning()) {
             httpServer.stop()
             httpServer.start()
+            thisLogger().info("MCP HTTP server reloaded on ${httpServer.host()}:${httpServer.port()}")
         }
     }
 

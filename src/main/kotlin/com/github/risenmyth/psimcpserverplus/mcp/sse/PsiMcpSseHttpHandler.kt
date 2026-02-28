@@ -1,5 +1,6 @@
 package com.github.risenmyth.psimcpserverplus.mcp.sse
 
+import com.github.risenmyth.psimcpserverplus.mcp.PsiMcpObservability
 import com.intellij.openapi.diagnostic.thisLogger
 import com.sun.net.httpserver.Headers
 import com.sun.net.httpserver.HttpExchange
@@ -27,21 +28,26 @@ class PsiMcpSseHttpHandler(
     private val errorInternal: Int,
     private val errorSessionNotFound: Int,
     private val errorProjectMismatch: Int,
+    private val observability: PsiMcpObservability? = null,
 ) : HttpHandler {
 
     override fun handle(exchange: HttpExchange) {
         val requestId = UUID.randomUUID().toString().substring(0, 8)
+        val method = exchange.requestMethod.uppercase(Locale.ROOT)
+        observability?.recordHttpRequest(method)
         thisLogger().debug("[$requestId] SSE connection request")
 
         try {
             if (!isOriginAllowed(exchange.requestHeaders)) {
+                observability?.recordSseRejected("forbidden_origin")
                 writeJsonError(exchange, 403, errorInvalidRequest, "Forbidden origin")
                 return
             }
 
-            when (exchange.requestMethod.uppercase(Locale.ROOT)) {
+            when (method) {
                 "GET" -> handleSseGet(exchange, requestId)
                 else -> {
+                    observability?.recordSseRejected("method_not_allowed")
                     exchange.responseHeaders.add("Allow", "GET")
                     writeStatus(exchange, httpMethodNotAllowed)
                 }
@@ -58,12 +64,14 @@ class PsiMcpSseHttpHandler(
 
         if (!acceptsSse(exchange.requestHeaders)) {
             thisLogger().debug("[$requestId] Unsupported Accept header for SSE request")
+            observability?.recordSseRejected("invalid_accept")
             writeJsonError(exchange, httpNotAcceptable, errorInvalidRequest, "Accept must include text/event-stream")
             return
         }
 
         if (sessionId.isNullOrBlank()) {
             thisLogger().debug("[$requestId] Missing session ID header")
+            observability?.recordSseRejected("missing_session_header")
             writeJsonError(exchange, httpBadRequest, errorInvalidRequest, "Missing MCP-Session-Id header")
             return
         }
@@ -71,11 +79,13 @@ class PsiMcpSseHttpHandler(
         val session = sessions[sessionId]
         if (session == null) {
             thisLogger().debug("[$requestId] Session not found: $sessionId")
+            observability?.recordSseRejected("session_not_found")
             writeJsonError(exchange, httpNotFound, errorSessionNotFound, "Session not found")
             return
         }
         if (session.isClosed()) {
             thisLogger().debug("[$requestId] Session already closed: $sessionId")
+            observability?.recordSseRejected("session_closed")
             writeJsonError(exchange, httpNotFound, errorSessionNotFound, "Session closed")
             return
         }
@@ -83,6 +93,7 @@ class PsiMcpSseHttpHandler(
         val mismatchError = validateProjectPathHeader(projectPathHeader, session)
         if (mismatchError != null) {
             thisLogger().debug("[$requestId] PROJECT_PATH mismatch for session: $sessionId")
+            observability?.recordSseRejected("project_mismatch")
             writeJsonError(exchange, httpConflict, errorProjectMismatch, mismatchError)
             return
         }
@@ -91,6 +102,7 @@ class PsiMcpSseHttpHandler(
         val lastEventId = lastEventIdHeader?.toLongOrNull()
         if (lastEventIdHeader != null && lastEventId == null) {
             thisLogger().debug("[$requestId] Invalid Last-Event-ID header: $lastEventIdHeader")
+            observability?.recordSseRejected("invalid_last_event_id")
             writeJsonError(exchange, httpBadRequest, errorInvalidRequest, "Invalid Last-Event-ID header")
             return
         }
@@ -99,19 +111,24 @@ class PsiMcpSseHttpHandler(
 
         if (!session.attachStream()) {
             thisLogger().debug("[$requestId] Stream already attached for session: $sessionId")
+            observability?.recordSseRejected("stream_already_attached")
             writeJsonError(exchange, httpConflict, errorInvalidRequest, "Stream already attached")
             return
         }
 
         thisLogger().info("[$requestId] SSE connected for session: $sessionId")
+        val connectedAt = System.currentTimeMillis()
 
         applySseHeaders(exchange.responseHeaders)
         exchange.sendResponseHeaders(200, 0)
+        observability?.recordHttpResponse(200)
+        observability?.recordSseConnectionOpened()
 
         try {
             exchange.responseBody.bufferedWriter(StandardCharsets.UTF_8).use { writer ->
                 val sseWriter = SseEventWriter(writer, sseConfig.retryTimeoutMs)
                 sseWriter.sendInitialHandshake()
+                observability?.recordSseEvent("handshake")
                 session.updateActivity()
 
                 val missedEvents = session.getEventsAfter(lastEventId)
@@ -121,6 +138,7 @@ class PsiMcpSseHttpHandler(
                         eventId,
                         SseEventFormatter.escapeJsonNewlines(eventPayload),
                     )
+                    observability?.recordSseEvent("message")
                     session.updateActivity()
                 }
 
@@ -129,6 +147,7 @@ class PsiMcpSseHttpHandler(
                     val initialPayload = "{}"
                     session.recordEvent(eventId, initialPayload)
                     sseWriter.sendEvent(SseConstants.EVENT_MESSAGE, eventId, initialPayload)
+                    observability?.recordSseEvent("message")
                     session.updateActivity()
                 }
 
@@ -142,6 +161,7 @@ class PsiMcpSseHttpHandler(
                             errorCode = errorSessionNotFound,
                             message = "Session not found",
                         )
+                        observability?.recordSseEvent("error")
                         break
                     }
 
@@ -151,6 +171,7 @@ class PsiMcpSseHttpHandler(
                             errorCode = errorSessionNotFound,
                             message = "Session expired",
                         )
+                        observability?.recordSseEvent("error")
                         sessions.remove(sessionId, session)
                         break
                     }
@@ -163,6 +184,7 @@ class PsiMcpSseHttpHandler(
                             message = "PROJECT_PATH does not match session-bound project",
                             details = runtimeMismatch,
                         )
+                        observability?.recordSseEvent("error")
                         break
                     }
 
@@ -181,11 +203,13 @@ class PsiMcpSseHttpHandler(
                                 eventId,
                                 SseEventFormatter.escapeJsonNewlines(payload),
                             )
+                            observability?.recordSseEvent("message")
                             session.updateActivity()
                             lastKeepAlive = now
                         } else {
                             if (now - lastKeepAlive >= keepAliveTimeout * 1000) {
                                 sseWriter.sendKeepAlive()
+                                observability?.recordSseEvent("keepalive")
                                 session.updateActivity()
                                 lastKeepAlive = now
                             }
@@ -198,8 +222,10 @@ class PsiMcpSseHttpHandler(
             }
         } finally {
             session.detachStream()
+            observability?.recordSseConnectionClosed()
+            val connectionDurationMs = System.currentTimeMillis() - connectedAt
             thisLogger().info(
-                "[$requestId] SSE disconnected for session: $sessionId (queueSize=${session.queueSize()}, dropped=${session.droppedCount()})",
+                "[$requestId] SSE disconnected for session: $sessionId (durationMs=$connectionDurationMs, queueSize=${session.queueSize()}, dropped=${session.droppedCount()})",
             )
         }
     }

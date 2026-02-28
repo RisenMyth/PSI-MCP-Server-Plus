@@ -7,6 +7,7 @@ class PsiMcpRpcProcessor(
     private val sessionManager: PsiMcpSessionManager,
     private val toolRegistry: PsiMcpToolRegistry,
     private val toolExecutor: PsiMcpToolExecutor,
+    private val observability: PsiMcpObservability,
 ) {
     fun handleRpc(request: JsonObject, sessionHeader: String?, projectPathHeader: String?): JsonElement? {
         val id = request["id"]
@@ -17,6 +18,7 @@ class PsiMcpRpcProcessor(
         val method = (request["method"] as? JsonPrimitive)?.contentOrNull
             ?.takeIf { it.isNotBlank() && !it.startsWith("rpc.") }
             ?: return rpcError(normalizeResponseId(id), ERROR_INVALID_REQUEST, "Invalid request")
+        observability?.recordRpcCall(method)
 
         return when (method) {
             "initialize" -> handleInitialize(id, projectPathHeader)
@@ -149,6 +151,7 @@ class PsiMcpRpcProcessor(
     }
 
     private fun rpcError(id: JsonElement, code: Int, message: String): JsonObject {
+        observability?.recordRpcError(code)
         return buildJsonObject {
             put("jsonrpc", JsonPrimitive("2.0"))
             put("id", id)

@@ -42,6 +42,7 @@ import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicLong
 
 class PsiMcpHttpServer(
     private val router: PsiMcpProjectRouter,
@@ -54,12 +55,14 @@ class PsiMcpHttpServer(
         prettyPrint = false
     }
     private val sseConfig = SseConfig()
-    private val sessionManager = PsiMcpSessionManager(router, sseConfig)
+    private val observability = PsiMcpObservability()
+    private val sessionManager = PsiMcpSessionManager(router, sseConfig, observability)
     private val rpcProcessor = PsiMcpRpcProcessor(
         router = router,
         sessionManager = sessionManager,
         toolRegistry = toolRegistry,
         toolExecutor = toolExecutor,
+        observability = observability,
     )
     private val sseHandler = createSseHandler()
 
@@ -79,6 +82,7 @@ class PsiMcpHttpServer(
     private var serverExecutor: ExecutorService? = null
 
     private val lifecycleLock = Any()
+    private val lastObservabilityLogAt = AtomicLong(0L)
 
     init {
         registerBuiltInTools()
@@ -99,6 +103,7 @@ class PsiMcpHttpServer(
 
         private const val MAX_REQUEST_BODY_BYTES = 1_048_576
         private const val RESOURCE_SHUTDOWN_TIMEOUT_MS = 3000L
+        private const val OBSERVABILITY_LOG_INTERVAL_MS = 60_000L
     }
 
 
@@ -112,6 +117,7 @@ class PsiMcpHttpServer(
             val created = try {
                 HttpServer.create(InetSocketAddress(config.listenAddress, config.port), 0)
             } catch (_: BindException) {
+                thisLogger().warn("Port ${config.port} on ${config.listenAddress} is unavailable, falling back to an ephemeral port")
                 HttpServer.create(InetSocketAddress(config.listenAddress, 0), 0)
             }
             val requestExecutor = Executors.newCachedThreadPool { r ->
@@ -130,8 +136,10 @@ class PsiMcpHttpServer(
                 boundPort = created.address.port
                 server = created
                 serverExecutor = requestExecutor
+                lastObservabilityLogAt.set(0L)
 
                 startHeartbeatSchedulerLocked()
+                thisLogger().info("MCP HTTP server started on $boundHost:$boundPort")
             } catch (t: Throwable) {
                 if (started) {
                     created.stop(0)
@@ -197,12 +205,15 @@ class PsiMcpHttpServer(
             }
 
             sessionManager.clearAll()
+            maybeLogObservabilitySnapshot(force = true)
+            thisLogger().info("MCP HTTP server stopped")
         }
     }
 
     private fun runHeartbeatCleanup() {
         try {
             cleanupExpiredSessions()
+            maybeLogObservabilitySnapshot(force = false)
         } catch (t: Throwable) {
             thisLogger().warn("Failed during SSE heartbeat cleanup", t)
         }
@@ -214,6 +225,24 @@ class PsiMcpHttpServer(
         if (removed > 0) {
             thisLogger().debug("Cleaned up $removed expired sessions")
         }
+    }
+
+    private fun maybeLogObservabilitySnapshot(force: Boolean) {
+        val now = System.currentTimeMillis()
+        if (!force) {
+            val last = lastObservabilityLogAt.get()
+            if (now - last < OBSERVABILITY_LOG_INTERVAL_MS) {
+                return
+            }
+            if (!lastObservabilityLogAt.compareAndSet(last, now)) {
+                return
+            }
+        } else {
+            lastObservabilityLogAt.set(now)
+        }
+
+        val snapshot = observability.snapshot(sessionManager.snapshot())
+        thisLogger().info("MCP observability snapshot: ${snapshot.toLogLine()}")
     }
 
     private fun shutdownExecutor(executor: ExecutorService, name: String) {
@@ -247,6 +276,8 @@ class PsiMcpHttpServer(
 
     private inner class McpHttpHandler : HttpHandler {
         override fun handle(exchange: HttpExchange) {
+            val method = exchange.requestMethod.uppercase(Locale.ROOT)
+            observability.recordHttpRequest(method)
             try {
                 if (!isOriginAllowed(exchange.requestHeaders)) {
                     writeJsonError(
@@ -258,7 +289,7 @@ class PsiMcpHttpServer(
                     return
                 }
 
-                when (exchange.requestMethod.uppercase(Locale.ROOT)) {
+                when (method) {
                     "POST" -> handlePost(exchange)
                     "GET" -> handleGet(exchange)
                     "DELETE" -> handleDelete(exchange)
@@ -268,7 +299,7 @@ class PsiMcpHttpServer(
                     }
                 }
             } catch (t: Throwable) {
-                thisLogger().warn("Failed to process MCP HTTP request", t)
+                thisLogger().warn("Failed to process MCP HTTP request (method=$method)", t)
                 writeJsonError(
                     exchange,
                     HTTP_INTERNAL_SERVER_ERROR,
@@ -334,6 +365,7 @@ class PsiMcpHttpServer(
             }
 
             exchange.sendResponseHeaders(httpStatus, responseBytes.size.toLong())
+            observability.recordHttpResponse(httpStatus)
             exchange.responseBody.use { it.write(responseBytes) }
         }
 
@@ -374,6 +406,7 @@ class PsiMcpHttpServer(
             errorInternal = PsiMcpRpcProcessor.ERROR_INTERNAL_ERROR,
             errorSessionNotFound = PsiMcpRpcProcessor.ERROR_SESSION_NOT_FOUND,
             errorProjectMismatch = PsiMcpRpcProcessor.ERROR_PROJECT_MISMATCH,
+            observability = observability,
         )
     }
 
@@ -570,6 +603,7 @@ class PsiMcpHttpServer(
     private fun writeStatus(exchange: HttpExchange, status: Int) {
         applySecurityHeaders(exchange.responseHeaders)
         exchange.sendResponseHeaders(status, -1)
+        observability.recordHttpResponse(status)
         exchange.close()
     }
 
@@ -588,6 +622,7 @@ class PsiMcpHttpServer(
 
         applyJsonHeaders(exchange.responseHeaders)
         exchange.sendResponseHeaders(status, body.size.toLong())
+        observability.recordHttpResponse(status)
         exchange.responseBody.use { it.write(body) }
     }
 
