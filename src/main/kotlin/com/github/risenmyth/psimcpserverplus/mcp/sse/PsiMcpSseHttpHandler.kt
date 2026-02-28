@@ -21,6 +21,7 @@ class PsiMcpSseHttpHandler(
     private val httpBadRequest: Int,
     private val httpNotFound: Int,
     private val httpConflict: Int,
+    private val httpNotAcceptable: Int,
     private val httpMethodNotAllowed: Int,
     private val errorInvalidRequest: Int,
     private val errorInternal: Int,
@@ -55,28 +56,42 @@ class PsiMcpSseHttpHandler(
         val sessionId = exchange.requestHeaders.firstValue("MCP-Session-Id")
         val projectPathHeader = exchange.requestHeaders.firstValue("PROJECT_PATH")
 
+        if (!acceptsSse(exchange.requestHeaders)) {
+            thisLogger().debug("[$requestId] Unsupported Accept header for SSE request")
+            writeJsonError(exchange, httpNotAcceptable, errorInvalidRequest, "Accept must include text/event-stream")
+            return
+        }
+
         if (sessionId.isNullOrBlank()) {
             thisLogger().debug("[$requestId] Missing session ID header")
-            writeStatus(exchange, httpBadRequest)
+            writeJsonError(exchange, httpBadRequest, errorInvalidRequest, "Missing MCP-Session-Id header")
             return
         }
 
         val session = sessions[sessionId]
         if (session == null) {
             thisLogger().debug("[$requestId] Session not found: $sessionId")
-            writeStatus(exchange, httpNotFound)
+            writeJsonError(exchange, httpNotFound, errorSessionNotFound, "Session not found")
             return
         }
         if (session.isClosed()) {
             thisLogger().debug("[$requestId] Session already closed: $sessionId")
-            writeStatus(exchange, httpNotFound)
+            writeJsonError(exchange, httpNotFound, errorSessionNotFound, "Session closed")
             return
         }
 
         val mismatchError = validateProjectPathHeader(projectPathHeader, session)
         if (mismatchError != null) {
             thisLogger().debug("[$requestId] PROJECT_PATH mismatch for session: $sessionId")
-            writeStatus(exchange, httpConflict)
+            writeJsonError(exchange, httpConflict, errorProjectMismatch, mismatchError)
+            return
+        }
+
+        val lastEventIdHeader = exchange.requestHeaders.firstValue("Last-Event-ID")
+        val lastEventId = lastEventIdHeader?.toLongOrNull()
+        if (lastEventIdHeader != null && lastEventId == null) {
+            thisLogger().debug("[$requestId] Invalid Last-Event-ID header: $lastEventIdHeader")
+            writeJsonError(exchange, httpBadRequest, errorInvalidRequest, "Invalid Last-Event-ID header")
             return
         }
 
@@ -84,7 +99,7 @@ class PsiMcpSseHttpHandler(
 
         if (!session.attachStream()) {
             thisLogger().debug("[$requestId] Stream already attached for session: $sessionId")
-            writeStatus(exchange, httpConflict)
+            writeJsonError(exchange, httpConflict, errorInvalidRequest, "Stream already attached")
             return
         }
 
@@ -99,7 +114,6 @@ class PsiMcpSseHttpHandler(
                 sseWriter.sendInitialHandshake()
                 session.updateActivity()
 
-                val lastEventId = parseLastEventId(exchange.requestHeaders)
                 val missedEvents = session.getEventsAfter(lastEventId)
                 for ((eventId, eventPayload) in missedEvents) {
                     sseWriter.sendEvent(
@@ -190,16 +204,17 @@ class PsiMcpSseHttpHandler(
         }
     }
 
+    private fun acceptsSse(headers: Headers): Boolean {
+        val accept = headers.firstValue("Accept") ?: return true
+        val lower = accept.lowercase(Locale.ROOT)
+        return lower.contains("text/event-stream") || lower.contains("*/*") || lower.contains("text/*")
+    }
+
     private fun applySseHeaders(headers: Headers) {
         headers.add("Content-Type", SseConstants.CONTENT_TYPE)
         headers.add("Cache-Control", SseConstants.CACHE_CONTROL)
         headers.add("Connection", SseConstants.CONNECTION)
         headers.add("X-Accel-Buffering", SseConstants.X_ACCEL_BUFFERING)
-    }
-
-    private fun parseLastEventId(headers: Headers): Long? {
-        val lastEventIdHeader = headers.firstValue("Last-Event-ID") ?: return null
-        return lastEventIdHeader.toLongOrNull()
     }
 
     private fun Headers.firstValue(name: String): String? {

@@ -3,6 +3,7 @@ package com.github.risenmyth.psimcpserverplus
 import com.github.risenmyth.psimcpserverplus.mcp.PsiMcpHttpServer
 import com.github.risenmyth.psimcpserverplus.mcp.PsiMcpInMemoryToolRegistry
 import com.github.risenmyth.psimcpserverplus.mcp.PsiMcpProjectRouter
+import com.github.risenmyth.psimcpserverplus.mcp.PsiMcpRpcProcessor
 import com.github.risenmyth.psimcpserverplus.mcp.PsiMcpToolRegistration
 import com.github.risenmyth.psimcpserverplus.services.PsiMcpProjectService
 import com.github.risenmyth.psimcpserverplus.services.PsiMcpRouterService
@@ -182,6 +183,40 @@ class MyPluginTest : BasePlatformTestCase() {
         assertEquals("Unknown PROJECT_PATH", errorMessage)
     }
 
+    fun testInitializeRejectsInvalidJsonRpcVersion() {
+        val projectService = project.service<PsiMcpProjectService>()
+        projectService.ensureStarted()
+
+        val response = projectService.dispatchForTest(
+            """
+            {"jsonrpc":"1.0","id":106,"method":"initialize","params":{}}
+            """.trimIndent(),
+            null,
+        )
+
+        assertNotNull(response)
+        val body = parseObject(response!!)
+        val errorCode = body["error"]?.jsonObject?.get("code")?.jsonPrimitive?.contentOrNull
+        assertEquals(PsiMcpRpcProcessor.ERROR_INVALID_REQUEST.toString(), errorCode)
+    }
+
+    fun testInitializeRejectsInvalidRequestIdType() {
+        val projectService = project.service<PsiMcpProjectService>()
+        projectService.ensureStarted()
+
+        val response = projectService.dispatchForTest(
+            """
+            {"jsonrpc":"2.0","id":{"nested":1},"method":"initialize","params":{}}
+            """.trimIndent(),
+            null,
+        )
+
+        assertNotNull(response)
+        val body = parseObject(response!!)
+        val errorCode = body["error"]?.jsonObject?.get("code")?.jsonPrimitive?.contentOrNull
+        assertEquals(PsiMcpRpcProcessor.ERROR_INVALID_REQUEST.toString(), errorCode)
+    }
+
     fun testSessionProjectPathMismatchReturnsError() {
         val projectService = project.service<PsiMcpProjectService>()
         projectService.ensureStarted()
@@ -217,6 +252,40 @@ class MyPluginTest : BasePlatformTestCase() {
         val mismatchJson = parseObject(mismatchResponse!!)
         val errorMessage = mismatchJson["error"]?.jsonObject?.get("message")?.jsonPrimitive?.contentOrNull
         assertEquals("PROJECT_PATH does not match session-bound project", errorMessage)
+    }
+
+    fun testToolsCallRejectsNonObjectArguments() {
+        val projectService = project.service<PsiMcpProjectService>()
+        projectService.ensureStarted()
+
+        val initJson = parseObject(
+            projectService.dispatchForTest(
+                """
+                {"jsonrpc":"2.0","id":107,"method":"initialize","params":{}}
+                """.trimIndent(),
+                null,
+            )!!,
+        )
+        val sessionId = extractSessionId(initJson)
+        assertNotNull(sessionId)
+
+        projectService.dispatchForTest(
+            """
+            {"jsonrpc":"2.0","method":"notifications/initialized"}
+            """.trimIndent(),
+            sessionId,
+        )
+
+        val response = projectService.dispatchForTest(
+            """
+            {"jsonrpc":"2.0","id":108,"method":"tools/call","params":{"name":"find_definition","arguments":"invalid"}}
+            """.trimIndent(),
+            sessionId,
+        )
+        assertNotNull(response)
+        val body = parseObject(response!!)
+        val errorCode = body["error"]?.jsonObject?.get("code")?.jsonPrimitive?.contentOrNull
+        assertEquals(PsiMcpRpcProcessor.ERROR_INVALID_PARAMS.toString(), errorCode)
     }
 
     fun testResolveProjectPathRequiresHeaderWhenMultipleProjectsRegistered() {
@@ -318,8 +387,12 @@ class MyPluginTest : BasePlatformTestCase() {
         val tools1 = response1["result"]!!.jsonObject["tools"]!!.jsonArray
         val tools2 = response2["result"]!!.jsonObject["tools"]!!.jsonArray
 
-        assertEquals(tools1.map { it.jsonObject["name"]!!.jsonPrimitive.content }, tools2.map { it.jsonObject["name"]!!.jsonPrimitive.content })
-        assertEquals(listOf("find_definition", "find_usages", "get_containing_context"), tools1.map { it.jsonObject["name"]!!.jsonPrimitive.content })
+        assertEquals(
+            tools1.map { it.jsonObject["name"]!!.jsonPrimitive.content },
+            tools2.map { it.jsonObject["name"]!!.jsonPrimitive.content })
+        assertEquals(
+            listOf("find_definition", "find_usages", "get_containing_context"),
+            tools1.map { it.jsonObject["name"]!!.jsonPrimitive.content })
     }
 
     fun testExistingAndNewToolInvokeInSameRuntime() {
@@ -342,13 +415,18 @@ class MyPluginTest : BasePlatformTestCase() {
 
             override fun resolveProject(projectPathHeader: String?) = when {
                 projectPathHeader == null -> error("PROJECT_PATH required")
-                projectPathHeader in known -> com.github.risenmyth.psimcpserverplus.mcp.ProjectRoutingResult.resolved(project, projectPathHeader)
+                projectPathHeader in known -> com.github.risenmyth.psimcpserverplus.mcp.ProjectRoutingResult.resolved(
+                    project,
+                    projectPathHeader
+                )
+
                 else -> com.github.risenmyth.psimcpserverplus.mcp.ProjectRoutingResult.error("Unknown PROJECT_PATH")
             }
 
             override fun normalizeProjectPath(path: String): String? = path.ifBlank { null }
 
-            override fun findProjectByPath(normalizedPath: String): Project? = if (normalizedPath in known) project else null
+            override fun findProjectByPath(normalizedPath: String): Project? =
+                if (normalizedPath in known) project else null
         }
 
         val server = PsiMcpHttpServer(
@@ -429,8 +507,8 @@ class MyPluginTest : BasePlatformTestCase() {
                     )
 
                     responseA["result"] != null &&
-                        responseB["result"] != null &&
-                        mismatch["error"]?.jsonObject?.get("message")?.jsonPrimitive?.contentOrNull == "PROJECT_PATH does not match session-bound project"
+                            responseB["result"] != null &&
+                            mismatch["error"]?.jsonObject?.get("message")?.jsonPrimitive?.contentOrNull == "PROJECT_PATH does not match session-bound project"
                 })
             }
             jobs.forEach { assertTrue(it.get()) }
@@ -559,7 +637,7 @@ class MyPluginTest : BasePlatformTestCase() {
             },
             handler = { _, _ ->
                 buildJsonObject {
-                    put("content", json.parseToJsonElement("[{\"type\":\"text\",\"text\":\"ok\"}]") )
+                    put("content", json.parseToJsonElement("[{\"type\":\"text\",\"text\":\"ok\"}]"))
                     put("isError", JsonPrimitive(false))
                 }
             },
@@ -568,7 +646,7 @@ class MyPluginTest : BasePlatformTestCase() {
 
     private fun errorResult(message: String): JsonObject {
         return buildJsonObject {
-            put("content", json.parseToJsonElement("[{\"type\":\"text\",\"text\":\"$message\"}]") )
+            put("content", json.parseToJsonElement("[{\"type\":\"text\",\"text\":\"$message\"}]"))
             put("isError", JsonPrimitive(true))
         }
     }

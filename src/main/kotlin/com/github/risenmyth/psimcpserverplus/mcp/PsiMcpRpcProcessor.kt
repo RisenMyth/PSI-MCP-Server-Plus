@@ -1,14 +1,6 @@
 package com.github.risenmyth.psimcpserverplus.mcp
 
-import kotlinx.serialization.json.JsonArray
-import kotlinx.serialization.json.JsonElement
-import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.JsonPrimitive
-import kotlinx.serialization.json.buildJsonArray
-import kotlinx.serialization.json.buildJsonObject
-import kotlinx.serialization.json.contentOrNull
-import kotlinx.serialization.json.jsonObject
-import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.*
 
 class PsiMcpRpcProcessor(
     private val router: PsiMcpProjectRouter,
@@ -18,8 +10,13 @@ class PsiMcpRpcProcessor(
 ) {
     fun handleRpc(request: JsonObject, sessionHeader: String?, projectPathHeader: String?): JsonElement? {
         val id = request["id"]
-        val method = request["method"]?.jsonPrimitive?.contentOrNull
-            ?: return id?.let { rpcError(it, ERROR_INVALID_REQUEST, "Invalid request") }
+        if (!isValidJsonRpcVersion(request["jsonrpc"]) || !isValidRequestId(id)) {
+            return rpcError(JsonNull, ERROR_INVALID_REQUEST, "Invalid request")
+        }
+
+        val method = (request["method"] as? JsonPrimitive)?.contentOrNull
+            ?.takeIf { it.isNotBlank() && !it.startsWith("rpc.") }
+            ?: return rpcError(normalizeResponseId(id), ERROR_INVALID_REQUEST, "Invalid request")
 
         return when (method) {
             "initialize" -> handleInitialize(id, projectPathHeader)
@@ -98,11 +95,15 @@ class PsiMcpRpcProcessor(
 
         val project = router.findProjectByPath(session.projectPath)
             ?: return rpcError(id, ERROR_PROJECT_NOT_FOUND, "No project registered")
-        val params = request["params"]?.jsonObject
+        val params = request["params"] as? JsonObject
             ?: return rpcError(id, ERROR_INVALID_PARAMS, "Invalid params")
-        val name = params["name"]?.jsonPrimitive?.contentOrNull
+        val name = (params["name"] as? JsonPrimitive)?.contentOrNull?.takeIf { it.isNotBlank() }
             ?: return rpcError(id, ERROR_INVALID_PARAMS, "Tool name missing")
-        val arguments = params["arguments"]?.jsonObject ?: buildJsonObject { }
+        val arguments = when (val args = params["arguments"]) {
+            null -> buildJsonObject { }
+            is JsonObject -> args
+            else -> return rpcError(id, ERROR_INVALID_PARAMS, "Invalid arguments")
+        }
 
         val toolResult = toolExecutor.execute(project, name, arguments)
         session.updateActivity()
@@ -155,6 +156,22 @@ class PsiMcpRpcProcessor(
                 put("code", JsonPrimitive(code))
                 put("message", JsonPrimitive(message))
             })
+        }
+    }
+
+    private fun normalizeResponseId(id: JsonElement?): JsonElement {
+        return if (isValidRequestId(id)) id ?: JsonNull else JsonNull
+    }
+
+    private fun isValidJsonRpcVersion(version: JsonElement?): Boolean {
+        return (version as? JsonPrimitive)?.contentOrNull == "2.0"
+    }
+
+    private fun isValidRequestId(id: JsonElement?): Boolean {
+        return when (id) {
+            null, JsonNull -> true
+            is JsonPrimitive -> id.isString || id.longOrNull != null || id.doubleOrNull != null
+            else -> false
         }
     }
 

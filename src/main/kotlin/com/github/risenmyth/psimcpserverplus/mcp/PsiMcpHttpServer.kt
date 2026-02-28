@@ -34,8 +34,11 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import java.net.BindException
 import java.net.InetSocketAddress
+import java.net.URI
+import java.io.ByteArrayOutputStream
 import java.nio.charset.StandardCharsets
 import java.util.Locale
+import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
@@ -72,67 +75,137 @@ class PsiMcpHttpServer(
     @Volatile
     private var heartbeatScheduler: ScheduledExecutorService? = null
 
+    @Volatile
+    private var serverExecutor: ExecutorService? = null
+
+    private val lifecycleLock = Any()
+
     init {
         registerBuiltInTools()
     }
 
     companion object {
+        const val HTTP_OK = 200
         const val HTTP_BAD_REQUEST = 400
+        const val HTTP_FORBIDDEN = 403
         const val HTTP_NOT_FOUND = 404
         const val HTTP_CONFLICT = 409
+        const val HTTP_NOT_ACCEPTABLE = 406
         const val HTTP_METHOD_NOT_ALLOWED = 405
+        const val HTTP_PAYLOAD_TOO_LARGE = 413
         const val HTTP_UNSUPPORTED_MEDIA_TYPE = 415
         const val HTTP_ACCEPTED = 202
+        const val HTTP_INTERNAL_SERVER_ERROR = 500
+
+        private const val MAX_REQUEST_BODY_BYTES = 1_048_576
+        private const val RESOURCE_SHUTDOWN_TIMEOUT_MS = 3000L
     }
 
 
     override fun start() {
-        if (server != null) {
+        synchronized(lifecycleLock) {
+            if (server != null) {
+                return
+            }
+
+            val config = resolveBindConfig()
+            val created = try {
+                HttpServer.create(InetSocketAddress(config.listenAddress, config.port), 0)
+            } catch (_: BindException) {
+                HttpServer.create(InetSocketAddress(config.listenAddress, 0), 0)
+            }
+            val requestExecutor = Executors.newCachedThreadPool { r ->
+                Thread(r, "MCP-HTTP-Worker").apply { isDaemon = true }
+            }
+            var started = false
+
+            try {
+                created.createContext("/mcp", McpHttpHandler())
+                created.createContext("/mcp/sse", sseHandler)
+                created.executor = requestExecutor
+                created.start()
+                started = true
+
+                boundHost = created.address.hostString
+                boundPort = created.address.port
+                server = created
+                serverExecutor = requestExecutor
+
+                startHeartbeatSchedulerLocked()
+            } catch (t: Throwable) {
+                if (started) {
+                    created.stop(0)
+                }
+                shutdownExecutor(requestExecutor, "MCP HTTP request executor")
+                server = null
+                serverExecutor = null
+                boundHost = ""
+                boundPort = -1
+                throw t
+            }
+        }
+    }
+
+    private fun startHeartbeatSchedulerLocked() {
+        if (heartbeatScheduler != null) {
             return
         }
 
-        val config = resolveBindConfig()
-        val created = try {
-            HttpServer.create(InetSocketAddress(config.listenAddress, config.port), 0)
-        } catch (_: BindException) {
-            HttpServer.create(InetSocketAddress(config.listenAddress, 0), 0)
-        }
-
-        created.createContext("/mcp", McpHttpHandler())
-        created.createContext("/mcp/sse", sseHandler)
-        created.executor = Executors.newCachedThreadPool()
-        created.start()
-
-        boundHost = created.address.hostString
-        boundPort = created.address.port
-        server = created
-
-        // Start heartbeat scheduler for session cleanup
-        startHeartbeatScheduler()
-    }
-
-    private fun startHeartbeatScheduler() {
         val intervalMs = sseConfig.heartbeatIntervalMs
-        heartbeatScheduler = Executors.newSingleThreadScheduledExecutor { r ->
+        val scheduler = Executors.newSingleThreadScheduledExecutor { r ->
             Thread(r, "MCP-SSE-Heartbeat").apply { isDaemon = true }
         }
-        heartbeatScheduler?.scheduleAtFixedRate(
-            this::cleanupExpiredSessions,
-            intervalMs,
-            intervalMs,
-            TimeUnit.MILLISECONDS,
-        )
+
+        try {
+            scheduler.scheduleAtFixedRate(
+                this::runHeartbeatCleanup,
+                intervalMs,
+                intervalMs,
+                TimeUnit.MILLISECONDS,
+            )
+            heartbeatScheduler = scheduler
+        } catch (t: Throwable) {
+            shutdownExecutor(scheduler, "SSE heartbeat scheduler")
+            throw t
+        }
+
         thisLogger().info("SSE heartbeat scheduler started with interval ${intervalMs / 1000}s")
     }
 
     override fun stop() {
-        heartbeatScheduler?.shutdown()
-        heartbeatScheduler = null
-        server?.stop(0)
-        server = null
-        boundHost = ""
-        boundPort = -1
-        sessionManager.clearAll()
+        synchronized(lifecycleLock) {
+            val scheduler = heartbeatScheduler
+            heartbeatScheduler = null
+
+            val activeServer = server
+            server = null
+
+            val requestExecutor = serverExecutor
+            serverExecutor = null
+
+            boundHost = ""
+            boundPort = -1
+
+            if (scheduler != null) {
+                shutdownExecutor(scheduler, "SSE heartbeat scheduler")
+            }
+
+            activeServer?.stop(0)
+
+            if (requestExecutor != null) {
+                shutdownExecutor(requestExecutor, "MCP HTTP request executor")
+            }
+
+            sessionManager.clearAll()
+        }
+    }
+
+    private fun runHeartbeatCleanup() {
+        try {
+            cleanupExpiredSessions()
+        } catch (t: Throwable) {
+            thisLogger().warn("Failed during SSE heartbeat cleanup", t)
+        }
     }
 
     private fun cleanupExpiredSessions() {
@@ -140,6 +213,23 @@ class PsiMcpHttpServer(
         val removed = sessionManager.cleanupExpiredSessions(timeoutMs)
         if (removed > 0) {
             thisLogger().debug("Cleaned up $removed expired sessions")
+        }
+    }
+
+    private fun shutdownExecutor(executor: ExecutorService, name: String) {
+        executor.shutdown()
+        try {
+            if (!executor.awaitTermination(RESOURCE_SHUTDOWN_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
+                val droppedTasks = executor.shutdownNow()
+                if (!executor.awaitTermination(RESOURCE_SHUTDOWN_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
+                    thisLogger().warn("$name did not terminate within timeout")
+                } else if (droppedTasks.isNotEmpty()) {
+                    thisLogger().debug("$name forced shutdown dropped ${droppedTasks.size} tasks")
+                }
+            }
+        } catch (_: InterruptedException) {
+            executor.shutdownNow()
+            Thread.currentThread().interrupt()
         }
     }
 
@@ -159,7 +249,12 @@ class PsiMcpHttpServer(
         override fun handle(exchange: HttpExchange) {
             try {
                 if (!isOriginAllowed(exchange.requestHeaders)) {
-                    writeJsonError(exchange, 403, -32600, "Forbidden origin")
+                    writeJsonError(
+                        exchange,
+                        HTTP_FORBIDDEN,
+                        PsiMcpRpcProcessor.ERROR_INVALID_REQUEST,
+                        "Forbidden origin"
+                    )
                     return
                 }
 
@@ -174,39 +269,60 @@ class PsiMcpHttpServer(
                 }
             } catch (t: Throwable) {
                 thisLogger().warn("Failed to process MCP HTTP request", t)
-                writeJsonError(exchange, 500, PsiMcpRpcProcessor.ERROR_INTERNAL_ERROR, "Internal error")
+                writeJsonError(
+                    exchange,
+                    HTTP_INTERNAL_SERVER_ERROR,
+                    PsiMcpRpcProcessor.ERROR_INTERNAL_ERROR,
+                    "Internal error"
+                )
             }
         }
 
         private fun handlePost(exchange: HttpExchange) {
             val contentType = exchange.requestHeaders.firstValue("Content-Type") ?: ""
-            if (!contentType.startsWith("application/json")) {
+            if (!contentType.lowercase(Locale.ROOT).startsWith("application/json")) {
                 writeStatus(exchange, HTTP_UNSUPPORTED_MEDIA_TYPE)
                 return
             }
 
-            val requestBody = exchange.requestBody.readAllBytes().toString(StandardCharsets.UTF_8)
-            val jsonObject = try {
-                json.parseToJsonElement(requestBody).jsonObject
+            val contentLength = exchange.requestHeaders.firstValue("Content-Length")?.toLongOrNull()
+            if (contentLength != null && contentLength > MAX_REQUEST_BODY_BYTES) {
+                writeStatus(exchange, HTTP_PAYLOAD_TOO_LARGE)
+                return
+            }
+
+            val requestBody = readRequestBodyWithLimit(exchange, MAX_REQUEST_BODY_BYTES)
+            if (requestBody == null) {
+                writeStatus(exchange, HTTP_PAYLOAD_TOO_LARGE)
+                return
+            }
+
+            val parsed = try {
+                json.parseToJsonElement(requestBody)
             } catch (_: Throwable) {
                 writeJsonError(exchange, HTTP_BAD_REQUEST, PsiMcpRpcProcessor.ERROR_PARSE_ERROR, "Parse error")
+                return
+            }
+            if (parsed !is JsonObject) {
+                writeJsonError(exchange, HTTP_BAD_REQUEST, PsiMcpRpcProcessor.ERROR_INVALID_REQUEST, "Invalid request")
                 return
             }
 
             val sessionHeader = exchange.requestHeaders.firstValue("MCP-Session-Id")
             val projectPathHeader = exchange.requestHeaders.firstValue("PROJECT_PATH")
-            val response = rpcProcessor.handleRpc(jsonObject, sessionHeader, projectPathHeader)
+            val response = rpcProcessor.handleRpc(parsed, sessionHeader, projectPathHeader)
             if (response == null) {
                 writeStatus(exchange, HTTP_ACCEPTED)
                 return
             }
 
+            val httpStatus = mapRpcResponseToHttpStatus(response)
             val responseText = json.encodeToString(JsonElement.serializer(), response)
             val responseBytes = responseText.toByteArray(StandardCharsets.UTF_8)
-            exchange.responseHeaders.add("Content-Type", "application/json; charset=utf-8")
+            applyJsonHeaders(exchange.responseHeaders)
 
-            val method = jsonObject["method"]?.jsonPrimitive?.contentOrNull
-            if (method == "initialize") {
+            val method = (parsed["method"] as? JsonPrimitive)?.contentOrNull
+            if (method == "initialize" && httpStatus == HTTP_OK) {
                 val newSessionId = response.jsonObject["result"]
                     ?.jsonObject
                     ?.get("_sessionId")
@@ -217,7 +333,7 @@ class PsiMcpHttpServer(
                 }
             }
 
-            exchange.sendResponseHeaders(200, responseBytes.size.toLong())
+            exchange.sendResponseHeaders(httpStatus, responseBytes.size.toLong())
             exchange.responseBody.use { it.write(responseBytes) }
         }
 
@@ -252,6 +368,7 @@ class PsiMcpHttpServer(
             httpBadRequest = HTTP_BAD_REQUEST,
             httpNotFound = HTTP_NOT_FOUND,
             httpConflict = HTTP_CONFLICT,
+            httpNotAcceptable = HTTP_NOT_ACCEPTABLE,
             httpMethodNotAllowed = HTTP_METHOD_NOT_ALLOWED,
             errorInvalidRequest = PsiMcpRpcProcessor.ERROR_INVALID_REQUEST,
             errorInternal = PsiMcpRpcProcessor.ERROR_INTERNAL_ERROR,
@@ -451,6 +568,7 @@ class PsiMcpHttpServer(
     }
 
     private fun writeStatus(exchange: HttpExchange, status: Int) {
+        applySecurityHeaders(exchange.responseHeaders)
         exchange.sendResponseHeaders(status, -1)
         exchange.close()
     }
@@ -468,9 +586,65 @@ class PsiMcpHttpServer(
             },
         ).toByteArray(StandardCharsets.UTF_8)
 
-        exchange.responseHeaders.add("Content-Type", "application/json; charset=utf-8")
+        applyJsonHeaders(exchange.responseHeaders)
         exchange.sendResponseHeaders(status, body.size.toLong())
         exchange.responseBody.use { it.write(body) }
+    }
+
+    private fun readRequestBodyWithLimit(exchange: HttpExchange, maxBytes: Int): String? {
+        val output = ByteArrayOutputStream()
+        var totalRead = 0
+        val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+
+        exchange.requestBody.use { input ->
+            while (true) {
+                val read = input.read(buffer)
+                if (read < 0) {
+                    break
+                }
+                totalRead += read
+                if (totalRead > maxBytes) {
+                    return null
+                }
+                output.write(buffer, 0, read)
+            }
+        }
+
+        return output.toString(StandardCharsets.UTF_8)
+    }
+
+    private fun mapRpcResponseToHttpStatus(response: JsonElement): Int {
+        val responseObject = response as? JsonObject ?: return HTTP_INTERNAL_SERVER_ERROR
+        val errorObject = responseObject["error"] as? JsonObject ?: return HTTP_OK
+        val errorCode = (errorObject["code"] as? JsonPrimitive)?.intOrNull ?: return HTTP_INTERNAL_SERVER_ERROR
+
+        return when (errorCode) {
+            PsiMcpRpcProcessor.ERROR_PARSE_ERROR,
+            PsiMcpRpcProcessor.ERROR_INVALID_REQUEST,
+            PsiMcpRpcProcessor.ERROR_INVALID_PARAMS -> HTTP_BAD_REQUEST
+
+            PsiMcpRpcProcessor.ERROR_METHOD_NOT_FOUND,
+            PsiMcpRpcProcessor.ERROR_PROJECT_NOT_FOUND,
+            PsiMcpRpcProcessor.ERROR_SESSION_NOT_FOUND -> HTTP_NOT_FOUND
+
+            PsiMcpRpcProcessor.ERROR_PROJECT_MISMATCH,
+            PsiMcpRpcProcessor.ERROR_SESSION_NOT_INITIALIZED -> HTTP_CONFLICT
+
+            PsiMcpRpcProcessor.ERROR_INTERNAL_ERROR -> HTTP_INTERNAL_SERVER_ERROR
+            else -> if (errorCode in -32099..-32000) HTTP_CONFLICT else HTTP_INTERNAL_SERVER_ERROR
+        }
+    }
+
+    private fun applyJsonHeaders(headers: Headers) {
+        headers.add("Content-Type", "application/json; charset=utf-8")
+        applySecurityHeaders(headers)
+    }
+
+    private fun applySecurityHeaders(headers: Headers) {
+        headers.add("X-Content-Type-Options", "nosniff")
+        headers.add("X-Frame-Options", "DENY")
+        headers.add("Referrer-Policy", "no-referrer")
+        headers.add("Cache-Control", "no-store")
     }
 
     private fun Headers.firstValue(name: String): String? {
@@ -481,11 +655,23 @@ class PsiMcpHttpServer(
 
     private fun isOriginAllowed(headers: Headers): Boolean {
         val origin = headers.firstValue("Origin") ?: return true
-        val lower = origin.lowercase(Locale.ROOT)
-        return lower.startsWith("http://localhost") ||
-            lower.startsWith("https://localhost") ||
-            lower.startsWith("http://127.0.0.1") ||
-            lower.startsWith("https://127.0.0.1")
+        val parsed = try {
+            URI(origin)
+        } catch (_: Throwable) {
+            return false
+        }
+
+        if (parsed.userInfo != null) {
+            return false
+        }
+
+        val scheme = parsed.scheme?.lowercase(Locale.ROOT) ?: return false
+        if (scheme != "http" && scheme != "https") {
+            return false
+        }
+
+        val host = parsed.host?.lowercase(Locale.ROOT) ?: return false
+        return host == "localhost" || host == "127.0.0.1" || host == "::1"
     }
 
     private data class ResolvedLocation(
