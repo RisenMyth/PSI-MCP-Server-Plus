@@ -1,10 +1,7 @@
 package com.github.risenmyth.psimcpserverplus.mcp
 
 import com.github.risenmyth.psimcpserverplus.mcp.sse.SseConfig
-import com.github.risenmyth.psimcpserverplus.mcp.sse.SseConstants
-import com.github.risenmyth.psimcpserverplus.mcp.sse.SseEventFormatter
-import com.github.risenmyth.psimcpserverplus.mcp.sse.SseEventWriter
-import com.github.risenmyth.psimcpserverplus.mcp.sse.SseSessionState
+import com.github.risenmyth.psimcpserverplus.mcp.sse.PsiMcpSseHttpHandler
 import com.github.risenmyth.psimcpserverplus.settings.PsiMcpBindConfig
 import com.intellij.openapi.application.ReadAction
 import com.intellij.openapi.diagnostic.thisLogger
@@ -39,8 +36,6 @@ import java.net.BindException
 import java.net.InetSocketAddress
 import java.nio.charset.StandardCharsets
 import java.util.Locale
-import java.util.UUID
-import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
@@ -55,8 +50,15 @@ class PsiMcpHttpServer(
         ignoreUnknownKeys = true
         prettyPrint = false
     }
-    private val sessions = ConcurrentHashMap<String, SseSessionState>()
     private val sseConfig = SseConfig()
+    private val sessionManager = PsiMcpSessionManager(router, sseConfig)
+    private val rpcProcessor = PsiMcpRpcProcessor(
+        router = router,
+        sessionManager = sessionManager,
+        toolRegistry = toolRegistry,
+        toolExecutor = toolExecutor,
+    )
+    private val sseHandler = createSseHandler()
 
     @Volatile
     private var server: HttpServer? = null
@@ -81,16 +83,6 @@ class PsiMcpHttpServer(
         const val HTTP_METHOD_NOT_ALLOWED = 405
         const val HTTP_UNSUPPORTED_MEDIA_TYPE = 415
         const val HTTP_ACCEPTED = 202
-
-        const val ERROR_PARSE_ERROR = -32700
-        const val ERROR_INVALID_REQUEST = -32600
-        const val ERROR_METHOD_NOT_FOUND = -32601
-        const val ERROR_INVALID_PARAMS = -32602
-        const val ERROR_INTERNAL_ERROR = -32603
-        const val ERROR_SESSION_NOT_FOUND = -32001
-        const val ERROR_SESSION_NOT_INITIALIZED = -32002
-        const val ERROR_PROJECT_NOT_FOUND = -32003
-        const val ERROR_PROJECT_MISMATCH = -32004
     }
 
 
@@ -107,7 +99,7 @@ class PsiMcpHttpServer(
         }
 
         created.createContext("/mcp", McpHttpHandler())
-        created.createContext("/mcp/sse", SseHttpHandler())
+        created.createContext("/mcp/sse", sseHandler)
         created.executor = Executors.newCachedThreadPool()
         created.start()
 
@@ -140,23 +132,14 @@ class PsiMcpHttpServer(
         server = null
         boundHost = ""
         boundPort = -1
-        sessions.clear()
+        sessionManager.clearAll()
     }
 
     private fun cleanupExpiredSessions() {
         val timeoutMs = sseConfig.sessionTimeoutMs
-        val beforeSize = sessions.size
-        val iterator = sessions.entries.iterator()
-        while (iterator.hasNext()) {
-            val entry = iterator.next()
-            if (entry.value.isExpired(timeoutMs)) {
-                iterator.remove()
-                thisLogger().info("Session expired and removed: ${entry.key}")
-            }
-        }
-        val afterSize = sessions.size
-        if (beforeSize > afterSize) {
-            thisLogger().debug("Cleaned up ${beforeSize - afterSize} expired sessions")
+        val removed = sessionManager.cleanupExpiredSessions(timeoutMs)
+        if (removed > 0) {
+            thisLogger().debug("Cleaned up $removed expired sessions")
         }
     }
 
@@ -168,7 +151,7 @@ class PsiMcpHttpServer(
 
     fun dispatchForTest(requestJson: String, sessionId: String?, projectPath: String? = null): String? {
         val parsed = json.parseToJsonElement(requestJson).jsonObject
-        val response = handleRpc(parsed, sessionId, projectPath)
+        val response = rpcProcessor.handleRpc(parsed, sessionId, projectPath)
         return response?.let { json.encodeToString(JsonElement.serializer(), it) }
     }
 
@@ -191,7 +174,7 @@ class PsiMcpHttpServer(
                 }
             } catch (t: Throwable) {
                 thisLogger().warn("Failed to process MCP HTTP request", t)
-                writeJsonError(exchange, 500, ERROR_INTERNAL_ERROR, "Internal error")
+                writeJsonError(exchange, 500, PsiMcpRpcProcessor.ERROR_INTERNAL_ERROR, "Internal error")
             }
         }
 
@@ -206,13 +189,13 @@ class PsiMcpHttpServer(
             val jsonObject = try {
                 json.parseToJsonElement(requestBody).jsonObject
             } catch (_: Throwable) {
-                writeJsonError(exchange, HTTP_BAD_REQUEST, ERROR_PARSE_ERROR, "Parse error")
+                writeJsonError(exchange, HTTP_BAD_REQUEST, PsiMcpRpcProcessor.ERROR_PARSE_ERROR, "Parse error")
                 return
             }
 
             val sessionHeader = exchange.requestHeaders.firstValue("MCP-Session-Id")
             val projectPathHeader = exchange.requestHeaders.firstValue("PROJECT_PATH")
-            val response = handleRpc(jsonObject, sessionHeader, projectPathHeader)
+            val response = rpcProcessor.handleRpc(jsonObject, sessionHeader, projectPathHeader)
             if (response == null) {
                 writeStatus(exchange, HTTP_ACCEPTED)
                 return
@@ -239,54 +222,8 @@ class PsiMcpHttpServer(
         }
 
         private fun handleGet(exchange: HttpExchange) {
-            // Legacy GET endpoint for backward compatibility
-            // New clients should use /mcp/sse
-            val sessionId = exchange.requestHeaders.firstValue("MCP-Session-Id")
-            if (sessionId.isNullOrBlank()) {
-                writeStatus(exchange, HTTP_BAD_REQUEST)
-                return
-            }
-            val session = sessions[sessionId]
-            if (session == null) {
-                writeStatus(exchange, HTTP_NOT_FOUND)
-                return
-            }
-            if (!session.attachStream()) {
-                writeStatus(exchange, HTTP_CONFLICT)
-                return
-            }
-
-            applySseHeaders(exchange.responseHeaders)
-            exchange.sendResponseHeaders(200, 0)
-
-            try {
-                exchange.responseBody.bufferedWriter(StandardCharsets.UTF_8).use { writer ->
-                    val sseWriter = SseEventWriter(writer, sseConfig.retryTimeoutMs)
-                    sseWriter.sendInitialHandshake()
-                    sseWriter.sendEvent(SseConstants.EVENT_MESSAGE, session.nextEventId(), "{}")
-                    session.updateActivity()
-
-                    while (session.streamAttached() && server != null) {
-                        val payload = session.pollEvent(sseConfig.keepAliveSeconds, TimeUnit.SECONDS)
-                        if (payload == null) {
-                            sseWriter.sendKeepAlive()
-                            continue
-                        }
-                        val eventId = session.nextEventId()
-                        session.recordEvent(eventId, payload)
-                        sseWriter.sendEvent(
-                            SseConstants.EVENT_MESSAGE,
-                            eventId,
-                            SseEventFormatter.escapeJsonNewlines(payload),
-                        )
-                        session.updateActivity()
-                    }
-                }
-            } catch (e: java.io.IOException) {
-                thisLogger().debug("Legacy SSE client disconnected: ${e.message}")
-            } finally {
-                session.detachStream()
-            }
+            // Keep /mcp GET for backward compatibility, but route to the unified SSE implementation.
+            sseHandler.handle(exchange)
         }
 
         private fun handleDelete(exchange: HttpExchange) {
@@ -295,7 +232,7 @@ class PsiMcpHttpServer(
                 writeStatus(exchange, HTTP_BAD_REQUEST)
                 return
             }
-            val removed = sessions.remove(sessionId)
+            val removed = sessionManager.removeSession(sessionId)
             if (removed != null) {
                 thisLogger().debug("Session deleted: $sessionId")
             }
@@ -303,244 +240,24 @@ class PsiMcpHttpServer(
         }
     }
 
-    /**
-     * Dedicated SSE HTTP Handler for /mcp/sse endpoint
-     */
-    private inner class SseHttpHandler : HttpHandler {
-        override fun handle(exchange: HttpExchange) {
-            val requestId = UUID.randomUUID().toString().substring(0, 8)
-            thisLogger().debug("[$requestId] SSE connection request")
-
-            try {
-                if (!isOriginAllowed(exchange.requestHeaders)) {
-                    writeJsonError(exchange, 403, -32600, "Forbidden origin")
-                    return
-                }
-
-                when (exchange.requestMethod.uppercase(Locale.ROOT)) {
-                    "GET" -> handleSseGet(exchange, requestId)
-                    else -> {
-                        exchange.responseHeaders.add("Allow", "GET")
-                        writeStatus(exchange, HTTP_METHOD_NOT_ALLOWED)
-                    }
-                }
-            } catch (t: Throwable) {
-                thisLogger().warn("[$requestId] Failed to process SSE request", t)
-                writeJsonError(exchange, 500, ERROR_INTERNAL_ERROR, "Internal error")
-            }
-        }
-
-        private fun handleSseGet(exchange: HttpExchange, requestId: String) {
-            val sessionId = exchange.requestHeaders.firstValue("MCP-Session-Id")
-            val projectPathHeader = exchange.requestHeaders.firstValue("PROJECT_PATH")
-            if (sessionId.isNullOrBlank()) {
-                thisLogger().debug("[$requestId] Missing session ID header")
-                writeStatus(exchange, HTTP_BAD_REQUEST)
-                return
-            }
-
-            val session = sessions[sessionId]
-            if (session == null) {
-                thisLogger().debug("[$requestId] Session not found: $sessionId")
-                writeStatus(exchange, HTTP_NOT_FOUND)
-                return
-            }
-
-            val mismatchError = validateProjectPathHeader(projectPathHeader, session)
-            if (mismatchError != null) {
-                thisLogger().debug("[$requestId] PROJECT_PATH mismatch for session: $sessionId")
-                writeStatus(exchange, HTTP_CONFLICT)
-                return
-            }
-
-            // Update activity timestamp
-            session.updateActivity()
-
-            if (!session.attachStream()) {
-                thisLogger().debug("[$requestId] Stream already attached for session: $sessionId")
-                writeStatus(exchange, HTTP_CONFLICT)
-                return
-            }
-
-            thisLogger().info("[$requestId] SSE connected for session: $sessionId")
-
-            applySseHeaders(exchange.responseHeaders)
-            exchange.sendResponseHeaders(200, 0)
-
-            try {
-                exchange.responseBody.bufferedWriter(StandardCharsets.UTF_8).use { writer ->
-                    val sseWriter = SseEventWriter(writer, sseConfig.retryTimeoutMs)
-
-                    // Send initial handshake with retry timeout
-                    sseWriter.sendInitialHandshake()
-
-                    // Parse Last-Event-ID header for reconnection
-                    val lastEventId = parseLastEventId(exchange.requestHeaders)
-
-                    // Send missed events if reconnecting
-                    val missedEvents = session.getEventsAfter(lastEventId)
-                    for ((eventId, eventPayload) in missedEvents) {
-                        val escapedEvent = SseEventFormatter.escapeJsonNewlines(eventPayload)
-                        sseWriter.sendEvent(SseConstants.EVENT_MESSAGE, eventId, escapedEvent)
-                        session.updateActivity()
-                    }
-
-                    // Send initial empty message if no missed events
-                    if (missedEvents.isEmpty() && lastEventId == null) {
-                        val eventId = session.nextEventId()
-                        sseWriter.sendEvent(SseConstants.EVENT_MESSAGE, eventId, "{}")
-                        session.updateActivity()
-                    }
-
-                    // Surface project mismatch as SSE error if it changes after connection setup
-                    val postAttachMismatch = validateProjectPathHeader(projectPathHeader, session)
-                    if (postAttachMismatch != null) {
-                        sseWriter.sendError(
-                            eventId = session.nextEventId(),
-                            errorCode = ERROR_PROJECT_MISMATCH,
-                            message = "PROJECT_PATH does not match session-bound project",
-                            details = postAttachMismatch,
-                        )
-                        return
-                    }
-
-                    // Main event loop
-                    val keepAliveTimeout = sseConfig.keepAliveSeconds
-                    var lastKeepAlive = System.currentTimeMillis()
-
-                    while (session.streamAttached() && server != null) {
-                        try {
-                            val payload = session.pollEvent(keepAliveTimeout, TimeUnit.SECONDS)
-                            val now = System.currentTimeMillis()
-
-                            if (payload != null) {
-                                val eventId = session.nextEventId()
-                                session.recordEvent(eventId, payload)
-                                val escapedPayload = SseEventFormatter.escapeJsonNewlines(payload)
-                                sseWriter.sendEvent(SseConstants.EVENT_MESSAGE, eventId, escapedPayload)
-                                session.updateActivity()
-                                lastKeepAlive = now
-                            } else {
-                                // Check if we need to send keep-alive
-                                if (now - lastKeepAlive >= keepAliveTimeout * 1000) {
-                                    sseWriter.sendKeepAlive()
-                                    lastKeepAlive = now
-                                }
-                            }
-                        } catch (e: java.io.IOException) {
-                            thisLogger().info("[$requestId] Client disconnected (IOException): ${e.message}")
-                            break
-                        }
-                    }
-                }
-            } finally {
-                session.detachStream()
-                thisLogger().info("[$requestId] SSE disconnected for session: $sessionId")
-            }
-        }
-
-        private fun parseLastEventId(headers: Headers): Long? {
-            val lastEventIdHeader = headers.firstValue("Last-Event-ID") ?: return null
-            return lastEventIdHeader.toLongOrNull()
-        }
-    }
-
-    private fun applySseHeaders(headers: Headers) {
-        headers.add("Content-Type", SseConstants.CONTENT_TYPE)
-        headers.add("Cache-Control", SseConstants.CACHE_CONTROL)
-        headers.add("Connection", SseConstants.CONNECTION)
-        headers.add("X-Accel-Buffering", SseConstants.X_ACCEL_BUFFERING)
-    }
-
-    private fun handleRpc(request: JsonObject, sessionHeader: String?, projectPathHeader: String?): JsonElement? {
-        val id = request["id"]
-        val method = request["method"]?.jsonPrimitive?.contentOrNull
-            ?: return id?.let { rpcError(it, ERROR_INVALID_REQUEST, "Invalid request") }
-
-        return when (method) {
-            "initialize" -> {
-                if (id == null) {
-                    null
-                } else {
-                    when (val resolved = router.resolveProject(projectPathHeader)) {
-                        is ProjectRoutingResult.Error -> rpcError(id, ERROR_PROJECT_NOT_FOUND, resolved.message)
-                        is ProjectRoutingResult.Resolved -> {
-                            val sessionId = UUID.randomUUID().toString()
-                            sessions[sessionId] = SseSessionState(sessionId, resolved.projectPath, sseConfig.queueSize)
-                            thisLogger().debug("Session created: $sessionId for project: ${resolved.projectPath}")
-                            rpcResult(id, initializeResult(sessionId))
-                        }
-                    }
-                }
-            }
-
-            "notifications/initialized" -> {
-                val session = validSession(sessionHeader) ?: return id?.let { rpcError(it, ERROR_SESSION_NOT_FOUND, "Session not found") }
-                val mismatchError = validateProjectPathHeader(projectPathHeader, session)
-                if (mismatchError != null) {
-                    return id?.let { rpcError(it, ERROR_PROJECT_MISMATCH, mismatchError) }
-                }
-                session.initialized = true
-                session.updateActivity()
-                null
-            }
-
-            "tools/list" -> {
-                if (id == null) {
-                    null
-                } else {
-                    val session = validSession(sessionHeader) ?: return rpcError(id, ERROR_SESSION_NOT_FOUND, "Session not found")
-                    val mismatchError = validateProjectPathHeader(projectPathHeader, session)
-                    if (mismatchError != null) {
-                        return rpcError(id, ERROR_PROJECT_MISMATCH, mismatchError)
-                    }
-                    if (!session.initialized) {
-                        return rpcError(id, ERROR_SESSION_NOT_INITIALIZED, "Session not initialized")
-                    }
-                    session.updateActivity()
-                    rpcResult(id, toolsListResult())
-                }
-            }
-
-            "tools/call" -> {
-                if (id == null) {
-                    null
-                } else {
-                    val session = validSession(sessionHeader) ?: return rpcError(id, ERROR_SESSION_NOT_FOUND, "Session not found")
-                    val mismatchError = validateProjectPathHeader(projectPathHeader, session)
-                    if (mismatchError != null) {
-                        return rpcError(id, ERROR_PROJECT_MISMATCH, mismatchError)
-                    }
-                    if (!session.initialized) {
-                        return rpcError(id, ERROR_SESSION_NOT_INITIALIZED, "Session not initialized")
-                    }
-                    val project = router.findProjectByPath(session.projectPath)
-                        ?: return rpcError(id, ERROR_PROJECT_NOT_FOUND, "No project registered")
-                    val params = request["params"]?.jsonObject
-                        ?: return rpcError(id, ERROR_INVALID_PARAMS, "Invalid params")
-                    val name = params["name"]?.jsonPrimitive?.contentOrNull
-                        ?: return rpcError(id, ERROR_INVALID_PARAMS, "Tool name missing")
-                    val arguments = params["arguments"]?.jsonObject ?: buildJsonObject { }
-                    val toolResult = toolExecutor.execute(project, name, arguments)
-                    session.updateActivity()
-                    rpcResult(id, toolResult)
-                }
-            }
-
-            else -> id?.let { rpcError(it, ERROR_METHOD_NOT_FOUND, "Method not found: $method") }
-        }
-    }
-
-    private fun validateProjectPathHeader(projectPathHeader: String?, session: SseSessionState): String? {
-        if (projectPathHeader == null) {
-            return null
-        }
-        val normalizedHeader = router.normalizeProjectPath(projectPathHeader)
-            ?: return "Invalid PROJECT_PATH"
-        if (normalizedHeader != session.projectPath) {
-            return "PROJECT_PATH does not match session-bound project"
-        }
-        return null
+    private fun createSseHandler(): HttpHandler {
+        return PsiMcpSseHttpHandler(
+            sessions = sessionManager.sessionMap(),
+            sseConfig = sseConfig,
+            validateProjectPathHeader = sessionManager::validateProjectPathHeader,
+            isOriginAllowed = ::isOriginAllowed,
+            writeStatus = ::writeStatus,
+            writeJsonError = ::writeJsonError,
+            isServerRunning = { server != null },
+            httpBadRequest = HTTP_BAD_REQUEST,
+            httpNotFound = HTTP_NOT_FOUND,
+            httpConflict = HTTP_CONFLICT,
+            httpMethodNotAllowed = HTTP_METHOD_NOT_ALLOWED,
+            errorInvalidRequest = PsiMcpRpcProcessor.ERROR_INVALID_REQUEST,
+            errorInternal = PsiMcpRpcProcessor.ERROR_INTERNAL_ERROR,
+            errorSessionNotFound = PsiMcpRpcProcessor.ERROR_SESSION_NOT_FOUND,
+            errorProjectMismatch = PsiMcpRpcProcessor.ERROR_PROJECT_MISMATCH,
+        )
     }
 
     private fun registerBuiltInTools() {
@@ -668,22 +385,6 @@ class PsiMcpHttpServer(
         })
     }
 
-    private fun toolsListResult(): JsonObject {
-        val tools = toolRegistry.listTools()
-        return buildJsonObject {
-            put("tools", buildJsonArray {
-                for (tool in tools) {
-                    add(buildJsonObject {
-                        put("name", JsonPrimitive(tool.id))
-                        put("title", JsonPrimitive(tool.title))
-                        put("description", JsonPrimitive(tool.description))
-                        put("inputSchema", tool.inputSchema)
-                    })
-                }
-            })
-        }
-    }
-
     private fun resolveLocation(project: Project, arguments: JsonObject): ResolvedLocation? {
         val filePath = arguments["file_path"]?.jsonPrimitive?.contentOrNull ?: return null
         val line = arguments["line"]?.jsonPrimitive?.intOrNull ?: return null
@@ -724,20 +425,6 @@ class PsiMcpHttpServer(
         return LocationResult(vFile.path, line, column)
     }
 
-    private fun initializeResult(sessionId: String): JsonObject {
-        return buildJsonObject {
-            put("protocolVersion", JsonPrimitive("2025-11-05"))
-            put("capabilities", buildJsonObject {
-                put("tools", buildJsonObject { })
-            })
-            put("serverInfo", buildJsonObject {
-                put("name", JsonPrimitive("psi-mcp-server-plus"))
-                put("version", JsonPrimitive("1.0.1"))
-            })
-            put("_sessionId", JsonPrimitive(sessionId))
-        }
-    }
-
     private fun toolTextWithStructured(text: String, structured: JsonObject): JsonObject {
         return buildJsonObject {
             put("content", buildJsonArray {
@@ -763,25 +450,6 @@ class PsiMcpHttpServer(
         }
     }
 
-    private fun rpcResult(id: JsonElement, result: JsonObject): JsonObject {
-        return buildJsonObject {
-            put("jsonrpc", JsonPrimitive("2.0"))
-            put("id", id)
-            put("result", result)
-        }
-    }
-
-    private fun rpcError(id: JsonElement, code: Int, message: String): JsonObject {
-        return buildJsonObject {
-            put("jsonrpc", JsonPrimitive("2.0"))
-            put("id", id)
-            put("error", buildJsonObject {
-                put("code", JsonPrimitive(code))
-                put("message", JsonPrimitive(message))
-            })
-        }
-    }
-
     private fun writeStatus(exchange: HttpExchange, status: Int) {
         exchange.sendResponseHeaders(status, -1)
         exchange.close()
@@ -803,13 +471,6 @@ class PsiMcpHttpServer(
         exchange.responseHeaders.add("Content-Type", "application/json; charset=utf-8")
         exchange.sendResponseHeaders(status, body.size.toLong())
         exchange.responseBody.use { it.write(body) }
-    }
-
-    private fun validSession(sessionId: String?): SseSessionState? {
-        if (sessionId.isNullOrBlank()) {
-            return null
-        }
-        return sessions[sessionId]
     }
 
     private fun Headers.firstValue(name: String): String? {
