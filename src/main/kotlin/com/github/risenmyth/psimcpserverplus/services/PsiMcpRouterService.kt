@@ -3,8 +3,8 @@ package com.github.risenmyth.psimcpserverplus.services
 import com.github.risenmyth.psimcpserverplus.mcp.ProjectRoutingResult
 import com.github.risenmyth.psimcpserverplus.mcp.PsiMcpHttpServer
 import com.github.risenmyth.psimcpserverplus.mcp.PsiMcpProjectRouter
-import com.github.risenmyth.psimcpserverplus.settings.McpServerBindConfig
-import com.github.risenmyth.psimcpserverplus.settings.McpServerSettingsService
+import com.github.risenmyth.psimcpserverplus.settings.PsiMcpBindConfig
+import com.github.risenmyth.psimcpserverplus.settings.PsiMcpSettingsService
 import com.intellij.openapi.components.Service
 import com.intellij.openapi.components.service
 import com.intellij.openapi.project.Project
@@ -16,7 +16,7 @@ class PsiMcpRouterService : PsiMcpProjectRouter {
     private val projectRegistry = ConcurrentHashMap<String, Project>()
     private val httpServer = PsiMcpHttpServer(
         router = this,
-        resolveBindConfig = { McpServerSettingsService.getInstance().getBindConfig() },
+        resolveBindConfig = { PsiMcpSettingsService.getInstance().getBindConfig() },
     )
 
     fun registerProject(project: Project) {
@@ -37,7 +37,7 @@ class PsiMcpRouterService : PsiMcpProjectRouter {
 
     fun serverPort(): Int = httpServer.port()
 
-    fun applyServerConfigIfChanged(oldConfig: McpServerBindConfig, newConfig: McpServerBindConfig) {
+    fun applyServerConfigIfChanged(oldConfig: PsiMcpBindConfig, newConfig: PsiMcpBindConfig) {
         if (oldConfig == newConfig) {
             return
         }

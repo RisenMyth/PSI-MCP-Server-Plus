@@ -4,49 +4,71 @@
 [![Version](https://img.shields.io/jetbrains/plugin/v/MARKETPLACE_ID.svg)](https://plugins.jetbrains.com/plugin/MARKETPLACE_ID)
 [![Downloads](https://img.shields.io/jetbrains/plugin/d/MARKETPLACE_ID.svg)](https://plugins.jetbrains.com/plugin/MARKETPLACE_ID)
 
-## Template ToDo list
-- [x] Create a new [IntelliJ Platform Plugin Template][template] project.
-- [ ] Get familiar with the [template documentation][template].
-- [ ] Adjust the [pluginGroup](./gradle.properties) and [pluginName](./gradle.properties), as well as the [id](./src/main/resources/META-INF/plugin.xml) and [sources package](./src/main/kotlin).
-- [ ] Adjust the plugin description in `README` (see [Tips][docs:plugin-description])
-- [ ] Review the [Legal Agreements](https://plugins.jetbrains.com/docs/marketplace/legal-agreements.html?from=IJPluginTemplate).
-- [ ] [Publish a plugin manually](https://plugins.jetbrains.com/docs/intellij/publishing-plugin.html?from=IJPluginTemplate) for the first time.
-- [ ] Set the `MARKETPLACE_ID` in the above README badges. You can obtain it once the plugin is published to JetBrains Marketplace.
-- [ ] Set the [Plugin Signing](https://plugins.jetbrains.com/docs/intellij/plugin-signing.html?from=IJPluginTemplate) related [secrets](https://github.com/JetBrains/intellij-platform-plugin-template#environment-variables).
-- [ ] Set the [Deployment Token](https://plugins.jetbrains.com/docs/marketplace/plugin-upload.html?from=IJPluginTemplate).
-- [ ] Click the <kbd>Watch</kbd> button on the top of the [IntelliJ Platform Plugin Template][template] to be notified about releases containing new features and fixes.
-- [ ] Configure the [CODECOV_TOKEN](https://docs.codecov.com/docs/quick-start) secret for automated test coverage reports on PRs
+## Overview
+PSI-MCP-Server-Plus is an IntelliJ Platform plugin that exposes a local MCP HTTP server and SSE endpoint for IDE-aware tooling.
+
+Core capabilities:
+- MCP JSON-RPC endpoint: `/mcp`
+- SSE stream endpoint: `/mcp/sse`
+- Multi-project routing via `PROJECT_PATH`
+- Session-to-project binding and mismatch protection
+- Runtime bind config (listen address and port) via IDE Settings page
 
 <!-- Plugin description -->
-This Fancy IntelliJ Platform Plugin is going to be your implementation of the brilliant ideas that you have.
+PSI-MCP-Server-Plus provides a local MCP server inside IntelliJ-based IDEs. 
+It supports MCP initialize/tool calls over HTTP and real-time events via SSE, with PROJECT_PATH-based routing for multi-project sessions.
 
-This specific section is a source for the [plugin.xml](/src/main/resources/META-INF/plugin.xml) file which will be extracted by the [Gradle](/build.gradle.kts) during the build process.
-
-To keep everything working, do not remove `<!-- ... -->` sections. 
+Settings are available under **Tools | PSI MCP Server Plus** to configure listen address (`127.0.0.1` / `0.0.0.0`) and port.
 <!-- Plugin description end -->
 
+## Package Structure
+- `src/main/kotlin/com/github/risenmyth/psimcpserverplus/startup`
+  - Startup entrypoint (`MyProjectActivity`).
+- `src/main/kotlin/com/github/risenmyth/psimcpserverplus/services`
+  - Project/app services and routing (`PsiMcpProjectService`, `PsiMcpRouterService`).
+- `src/main/kotlin/com/github/risenmyth/psimcpserverplus/mcp`
+  - MCP contracts, transport server, tool registry and execution.
+- `src/main/kotlin/com/github/risenmyth/psimcpserverplus/mcp/sse`
+  - SSE event/session/config helpers.
+- `src/main/kotlin/com/github/risenmyth/psimcpserverplus/settings`
+  - Persistent settings model/service (`PsiMcpBindConfig`, `PsiMcpSettingsService`).
+- `src/main/kotlin/com/github/risenmyth/psimcpserverplus/ui/settings`
+  - Settings UI (`PsiMcpSettingsConfigurable`, `PsiMcpSettingsPanel`).
+- `src/main/kotlin/com/github/risenmyth/psimcpserverplus/ui/toolwindow`
+  - Reserved for future ToolWindow implementation.
+- `src/main/kotlin/com/github/risenmyth/psimcpserverplus/ui/dialog`
+  - Reserved for future dialog UI.
+- `src/main/kotlin/com/github/risenmyth/psimcpserverplus/actions`
+  - Reserved for IDE actions.
+
+## Configuration
+Settings page: `Tools | PSI MCP Server Plus`
+- Listen address: `127.0.0.1` or `0.0.0.0`
+- Port: `1..65535`
+
+Changes to address/port trigger MCP server restart when the server is already running.
+
+## Development
+Run key checks from project root:
+
+```bash
+./gradlew build
+./gradlew test
+```
+
+For focused settings regression tests:
+
+```bash
+./gradlew test --tests com.github.risenmyth.psimcpserverplus.MyPluginTest.testSettingsConfigurableLifecycleIsModifiedApplyAndReset
+./gradlew test --tests com.github.risenmyth.psimcpserverplus.MyPluginTest.testSettingsApplyTriggersServerReloadOnPortChange
+./gradlew test --tests com.github.risenmyth.psimcpserverplus.MyPluginTest.testSettingsServiceResolutionAndPersistenceAfterRename
+```
+
 ## Installation
-
-- Using the IDE built-in plugin system:
-
-  <kbd>Settings/Preferences</kbd> > <kbd>Plugins</kbd> > <kbd>Marketplace</kbd> > <kbd>Search for "PSI-MCP-Server-Plus"</kbd> >
-  <kbd>Install</kbd>
-
-- Using JetBrains Marketplace:
-
-  Go to [JetBrains Marketplace](https://plugins.jetbrains.com/plugin/MARKETPLACE_ID) and install it by clicking the <kbd>Install to ...</kbd> button in case your IDE is running.
-
-  You can also download the [latest release](https://plugins.jetbrains.com/plugin/MARKETPLACE_ID/versions) from JetBrains Marketplace and install it manually using
-  <kbd>Settings/Preferences</kbd> > <kbd>Plugins</kbd> > <kbd>⚙️</kbd> > <kbd>Install plugin from disk...</kbd>
-
-- Manually:
-
-  Download the [latest release](https://github.com/RisenMyth/PSI-MCP-Server-Plus/releases/latest) and install it manually using
-  <kbd>Settings/Preferences</kbd> > <kbd>Plugins</kbd> > <kbd>⚙️</kbd> > <kbd>Install plugin from disk...</kbd>
-
+- Use IntelliJ/IDEA plugin marketplace UI, search `PSI-MCP-Server-Plus`.
+- Or install downloaded ZIP from disk in `Settings/Preferences | Plugins`.
 
 ---
 Plugin based on the [IntelliJ Platform Plugin Template][template].
 
 [template]: https://github.com/JetBrains/intellij-platform-plugin-template
-[docs:plugin-description]: https://plugins.jetbrains.com/docs/intellij/plugin-user-experience.html#plugin-description-and-presentation

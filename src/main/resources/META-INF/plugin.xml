@@ -12,6 +12,6 @@
                 parentId="tools"
                 id="com.github.risenmyth.psimcpserverplus.settings"
                 displayName="PSI MCP Server Plus"
-                instance="com.github.risenmyth.psimcpserverplus.settings.McpServerConfigurable"/>
+                instance="com.github.risenmyth.psimcpserverplus.ui.settings.PsiMcpSettingsConfigurable"/>
     </extensions>
 </idea-plugin>

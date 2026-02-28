@@ -7,11 +7,15 @@ import com.github.risenmyth.psimcpserverplus.mcp.PsiMcpToolRegistration
 import com.github.risenmyth.psimcpserverplus.services.PsiMcpProjectService
 import com.github.risenmyth.psimcpserverplus.services.PsiMcpRouterService
 import com.github.risenmyth.psimcpserverplus.services.ProjectPathResolution
+import com.github.risenmyth.psimcpserverplus.settings.PsiMcpBindConfig
+import com.github.risenmyth.psimcpserverplus.settings.PsiMcpSettingsService
+import com.github.risenmyth.psimcpserverplus.ui.settings.PsiMcpSettingsConfigurable
 import com.intellij.ide.highlighter.XmlFileType
 import com.intellij.openapi.components.service
 import com.intellij.openapi.util.io.FileUtil
 import com.intellij.openapi.project.Project
 import com.intellij.testFramework.fixtures.BasePlatformTestCase
+import com.intellij.testFramework.runInEdtAndWait
 import com.intellij.util.PsiErrorElementUtil
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
@@ -21,9 +25,15 @@ import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import java.awt.Component
+import java.awt.Container
+import java.net.ServerSocket
 import java.util.concurrent.Callable
 import java.util.concurrent.Executors
 import java.util.concurrent.Future
+import javax.swing.JComboBox
+import javax.swing.JComponent
+import javax.swing.JSpinner
 
 class MyPluginTest : BasePlatformTestCase() {
     private val json = Json { ignoreUnknownKeys = true }
@@ -429,6 +439,115 @@ class MyPluginTest : BasePlatformTestCase() {
         }
     }
 
+    fun testSettingsConfigurableLifecycleIsModifiedApplyAndReset() {
+        val settingsService = PsiMcpSettingsService.getInstance()
+        val original = settingsService.getBindConfig()
+        val initial = PsiMcpBindConfig(
+            listenAddress = PsiMcpBindConfig.DEFAULT_LISTEN_ADDRESS,
+            port = 22000,
+        )
+
+        try {
+            settingsService.updateBindConfig(initial)
+            val configurable = PsiMcpSettingsConfigurable()
+            lateinit var component: JComponent
+            lateinit var addressBox: JComboBox<*>
+            lateinit var portSpinner: JSpinner
+
+            runInEdtAndWait {
+                component = configurable.createComponent()
+                addressBox = findComponent(component)
+                portSpinner = findComponent(component)
+            }
+
+            assertFalse(configurable.isModified())
+
+            runInEdtAndWait {
+                addressBox.selectedItem = PsiMcpBindConfig.BIND_ALL_ADDRESSES
+                portSpinner.value = 22001
+            }
+
+            assertTrue(configurable.isModified())
+            runInEdtAndWait { configurable.apply() }
+            assertEquals(PsiMcpBindConfig(PsiMcpBindConfig.BIND_ALL_ADDRESSES, 22001), settingsService.getBindConfig())
+
+            runInEdtAndWait { addressBox.selectedItem = PsiMcpBindConfig.DEFAULT_LISTEN_ADDRESS }
+            assertTrue(configurable.isModified())
+            runInEdtAndWait { configurable.reset() }
+
+            val resetConfig = settingsService.getBindConfig()
+            assertEquals(resetConfig.listenAddress, addressBox.selectedItem)
+            assertEquals(resetConfig.port, (portSpinner.value as Number).toInt())
+            assertFalse(configurable.isModified())
+            runInEdtAndWait { configurable.disposeUIResources() }
+        } finally {
+            settingsService.updateBindConfig(original)
+        }
+    }
+
+    fun testSettingsApplyTriggersServerReloadOnPortChange() {
+        val settingsService = PsiMcpSettingsService.getInstance()
+        val routerService = PsiMcpRouterService.getInstance()
+        val original = settingsService.getBindConfig()
+        val oldPort = findFreePort()
+        val newPort = findFreePort(exclude = setOf(oldPort))
+
+        try {
+            settingsService.updateBindConfig(PsiMcpBindConfig(PsiMcpBindConfig.DEFAULT_LISTEN_ADDRESS, oldPort))
+            routerService.ensureServerStarted()
+            val runningPortBefore = routerService.serverPort()
+
+            val configurable = PsiMcpSettingsConfigurable()
+            lateinit var component: JComponent
+            lateinit var addressBox: JComboBox<*>
+            lateinit var portSpinner: JSpinner
+
+            runInEdtAndWait {
+                component = configurable.createComponent()
+                addressBox = findComponent(component)
+                portSpinner = findComponent(component)
+                addressBox.selectedItem = PsiMcpBindConfig.DEFAULT_LISTEN_ADDRESS
+                portSpinner.value = newPort
+                configurable.apply()
+                configurable.disposeUIResources()
+            }
+
+            assertEquals(newPort, settingsService.getBindConfig().port)
+            assertEquals(newPort, routerService.serverPort())
+            assertTrue(runningPortBefore != routerService.serverPort())
+        } finally {
+            val current = settingsService.getBindConfig()
+            settingsService.updateBindConfig(original)
+            routerService.applyServerConfigIfChanged(current, settingsService.getBindConfig())
+        }
+    }
+
+    fun testSettingsServiceResolutionAndPersistenceAfterRename() {
+        val settingsService = service<PsiMcpSettingsService>()
+        val original = settingsService.getBindConfig()
+
+        try {
+            settingsService.loadState(
+                PsiMcpSettingsService.State(
+                    listenAddress = "not-allowed",
+                    port = 70000,
+                ),
+            )
+            assertEquals(
+                PsiMcpBindConfig(PsiMcpBindConfig.DEFAULT_LISTEN_ADDRESS, PsiMcpBindConfig.DEFAULT_PORT),
+                settingsService.getBindConfig(),
+            )
+
+            val expected = PsiMcpBindConfig(PsiMcpBindConfig.BIND_ALL_ADDRESSES, 23001)
+            settingsService.updateBindConfig(expected)
+            assertEquals(expected, settingsService.getBindConfig())
+            assertEquals(expected.listenAddress, settingsService.getState().listenAddress)
+            assertEquals(expected.port, settingsService.getState().port)
+        } finally {
+            settingsService.updateBindConfig(original)
+        }
+    }
+
     private fun testTool(id: String): PsiMcpToolRegistration {
         return PsiMcpToolRegistration(
             id = id,
@@ -468,5 +587,34 @@ class MyPluginTest : BasePlatformTestCase() {
         return project.basePath
             ?: project.projectFilePath
             ?: error("Project path unavailable for test")
+    }
+
+    private inline fun <reified T : Component> findComponent(root: Component): T =
+        findComponent(root, T::class.java)
+
+    private fun <T : Component> findComponent(root: Component, componentClass: Class<T>): T {
+        if (componentClass.isInstance(root)) {
+            return componentClass.cast(root)
+        }
+        if (root is Container) {
+            for (child in root.components) {
+                try {
+                    return findComponent(child, componentClass)
+                } catch (_: NoSuchElementException) {
+                    // Continue search in next child.
+                }
+            }
+        }
+        throw NoSuchElementException("Component ${componentClass.simpleName} not found")
+    }
+
+    private fun findFreePort(exclude: Set<Int> = emptySet()): Int {
+        repeat(20) {
+            val candidate = ServerSocket(0).use { it.localPort }
+            if (!exclude.contains(candidate)) {
+                return candidate
+            }
+        }
+        error("Unable to allocate free TCP port")
     }
 }
