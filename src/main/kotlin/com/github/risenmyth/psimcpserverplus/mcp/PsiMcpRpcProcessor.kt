@@ -43,14 +43,18 @@ class PsiMcpRpcProcessor(
         }
     }
 
-    private fun handleInitializedNotification(id: JsonElement?, sessionHeader: String?, projectPathHeader: String?): JsonElement? {
+    private fun handleInitializedNotification(
+        id: JsonElement?,
+        sessionHeader: String?,
+        projectPathHeader: String?
+    ): JsonElement? {
         val session = sessionManager.getSession(sessionHeader)
             ?: return id?.let { rpcError(it, ERROR_SESSION_NOT_FOUND, "Session not found") }
         val mismatchError = sessionManager.validateProjectPathHeader(projectPathHeader, session)
         if (mismatchError != null) {
             return id?.let { rpcError(it, ERROR_PROJECT_MISMATCH, mismatchError) }
         }
-        session.initialized = true
+        session.isInitialized = true
         session.updateActivity()
         return null
     }
@@ -65,7 +69,7 @@ class PsiMcpRpcProcessor(
         if (mismatchError != null) {
             return rpcError(id, ERROR_PROJECT_MISMATCH, mismatchError)
         }
-        if (!session.initialized) {
+        if (!session.isInitialized) {
             return rpcError(id, ERROR_SESSION_NOT_INITIALIZED, "Session not initialized")
         }
         session.updateActivity()
@@ -88,7 +92,7 @@ class PsiMcpRpcProcessor(
         if (mismatchError != null) {
             return rpcError(id, ERROR_PROJECT_MISMATCH, mismatchError)
         }
-        if (!session.initialized) {
+        if (!session.isInitialized) {
             return rpcError(id, ERROR_SESSION_NOT_INITIALIZED, "Session not initialized")
         }
 

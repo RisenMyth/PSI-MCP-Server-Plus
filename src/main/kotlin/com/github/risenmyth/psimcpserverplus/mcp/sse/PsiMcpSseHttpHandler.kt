@@ -67,6 +67,11 @@ class PsiMcpSseHttpHandler(
             writeStatus(exchange, httpNotFound)
             return
         }
+        if (session.isClosed()) {
+            thisLogger().debug("[$requestId] Session already closed: $sessionId")
+            writeStatus(exchange, httpNotFound)
+            return
+        }
 
         val mismatchError = validateProjectPathHeader(projectPathHeader, session)
         if (mismatchError != null) {
@@ -152,6 +157,9 @@ class PsiMcpSseHttpHandler(
                         val now = System.currentTimeMillis()
 
                         if (payload != null) {
+                            if (payload == SseSessionState.TERMINATION_EVENT) {
+                                break
+                            }
                             val eventId = session.nextEventId()
                             session.recordEvent(eventId, payload)
                             sseWriter.sendEvent(

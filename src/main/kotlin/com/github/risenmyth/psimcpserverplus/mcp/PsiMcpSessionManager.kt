@@ -29,12 +29,13 @@ class PsiMcpSessionManager(
         if (sessionId.isNullOrBlank()) {
             return null
         }
-        return sessions.remove(sessionId)
+        return sessions.remove(sessionId)?.also { it.close() }
     }
 
     fun sessionMap(): ConcurrentHashMap<String, SseSessionState> = sessions
 
     fun clearAll() {
+        sessions.values.forEach { it.close() }
         sessions.clear()
     }
 
@@ -44,6 +45,7 @@ class PsiMcpSessionManager(
         while (iterator.hasNext()) {
             val entry = iterator.next()
             if (entry.value.isExpired(timeoutMs)) {
+                entry.value.close()
                 iterator.remove()
                 removed++
             }

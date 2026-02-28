@@ -11,8 +11,8 @@ class SseSessionState(
     val projectPath: String,
     queueSize: Int,
 ) {
-    @Volatile
-    var initialized: Boolean = false
+    private val initialized = AtomicBoolean(false)
+    private val closed = AtomicBoolean(false)
 
     @Volatile
     var lastActivity: Long = System.currentTimeMillis()
@@ -23,7 +23,18 @@ class SseSessionState(
     private val droppedEventCount = AtomicLong(0L)
     private val eventHistory = ConcurrentSkipListMap<Long, String>()
 
-    fun attachStream(): Boolean = streamAttached.compareAndSet(false, true)
+    var isInitialized: Boolean
+        get() = initialized.get()
+        set(value) {
+            initialized.set(value)
+        }
+
+    fun attachStream(): Boolean {
+        if (closed.get()) {
+            return false
+        }
+        return streamAttached.compareAndSet(false, true)
+    }
 
     fun detachStream() {
         streamAttached.set(false)
@@ -36,6 +47,9 @@ class SseSessionState(
     fun nextEventId(): Long = eventCounter.incrementAndGet()
 
     fun offerEvent(event: String): Boolean {
+        if (closed.get()) {
+            return false
+        }
         val offered = eventQueue.offer(event)
         if (!offered) {
             droppedEventCount.incrementAndGet()
@@ -67,14 +81,31 @@ class SseSessionState(
         return System.currentTimeMillis() - lastActivity > timeoutMs
     }
 
+    fun close() {
+        if (!closed.compareAndSet(false, true)) {
+            return
+        }
+        streamAttached.set(false)
+        if (!eventQueue.offer(TERMINATION_EVENT)) {
+            eventQueue.poll()
+            eventQueue.offer(TERMINATION_EVENT)
+        }
+    }
+
+    fun isClosed(): Boolean = closed.get()
+
     fun queueSize(): Int = eventQueue.size
 
     fun droppedCount(): Long = droppedEventCount.get()
 
     override fun toString(): String {
         return "SseSessionState(id=$id, projectPath=$projectPath, " +
-            "initialized=$initialized, streamAttached=${streamAttached.get()}, " +
-            "queueSize=${eventQueue.size}, droppedEvents=${droppedEventCount.get()}, " +
-            "lastActivity=$lastActivity)"
+                "initialized=${initialized.get()}, closed=${closed.get()}, streamAttached=${streamAttached.get()}, " +
+                "queueSize=${eventQueue.size}, droppedEvents=${droppedEventCount.get()}, " +
+                "lastActivity=$lastActivity)"
+    }
+
+    companion object {
+        const val TERMINATION_EVENT = "__PSI_MCP_INTERNAL_SESSION_TERMINATED__"
     }
 }
